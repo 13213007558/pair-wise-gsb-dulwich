@@ -20,15 +20,43 @@
 # License, Version 2.0.
 #
 
-"""Generates tarballs for Git trees."""
+"""Generates tarballs for Git trees.
+
+The archive writer honours the "export-ignore" and "export-subst"
+gitattributes, read from the tree being archived (never from the local
+working tree):
+
+* "export-ignore" excludes the matching path from the archive. When it
+  is set on a directory, the whole subtree below it is omitted.
+* "export-subst" enables "$Format:...$" placeholder expansion in the
+  matching files. The supported placeholders are %H (full commit hash),
+  %h (abbreviated commit hash), %aI (author time, strict ISO 8601), %s
+  (commit subject) and %% (a literal percent sign). A "$Format:...$"
+  string containing any other placeholder is copied into the archive
+  verbatim, unexpanded.
+
+Attribute resolution follows git's rules: ".gitattributes" files are
+read from the archived tree itself, files deeper in the directory
+hierarchy override shallower ones, and within one file later lines
+override earlier ones. "-attr" unsets an attribute and "!attr" resets it
+to the unspecified state, dropping any value inherited from a shallower
+file.
+
+Placeholder expansion needs a commit to take values from. When
+"tar_stream" is called with only a tree (no "commit" argument),
+"export-subst" files are archived with their "$Format:...$" strings
+left untouched.
+"""
 
 __all__ = ["ChunkedBytesIO", "UnsafeArchivePathError", "tar_stream"]
 
+import datetime
 import posixpath
+import re
 import stat
 import struct
 import tarfile
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import closing
 from io import BytesIO
 from os import SEEK_END
@@ -36,8 +64,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from .object_store import BaseObjectStore
-    from .objects import TreeEntry
+    from .objects import Commit, TreeEntry
 
+from .attrs import (
+    AttributeValue,
+    Pattern,
+    compile_gitattributes_patterns,
+    parse_git_attributes,
+)
 from .index import cleanup_mode
 from .objects import Blob, Tree
 
@@ -90,6 +124,126 @@ def _is_unsafe_archive_path(path: bytes) -> bool:
         if normalized in _INVALID_PATH_COMPONENTS:
             return True
     return False
+
+
+def _tree_gitattributes(
+    store: "BaseObjectStore", tree: Tree
+) -> list[tuple[Pattern, Mapping[bytes, AttributeValue]]]:
+    """Read and compile the .gitattributes patterns stored in a tree.
+
+    The attributes are taken from the tree being archived, never from the
+    local working tree, so archiving a commit does not depend on whatever
+    happens to be checked out.
+    """
+    for name, mode, sha in tree.iteritems():
+        if name == b".gitattributes" and mode is not None and stat.S_ISREG(mode):
+            blob = store[sha]
+            if isinstance(blob, Blob):
+                return compile_gitattributes_patterns(
+                    parse_git_attributes(BytesIO(blob.data)),
+                    source=b".gitattributes",
+                )
+    return []
+
+
+# A stack of (directory, patterns) pairs, from the archive root downwards.
+# Patterns in each entry match paths relative to their directory.
+_AttrStack = Sequence[
+    tuple[bytes, Sequence[tuple[Pattern, Mapping[bytes, AttributeValue]]]]
+]
+
+
+def _match_attrs(
+    attr_stack: _AttrStack, path: bytes, is_dir: bool = False
+) -> dict[bytes, AttributeValue]:
+    """Resolve the attributes for a repo-relative path.
+
+    Patterns from shallower ".gitattributes" files are applied first and
+    deeper ones override them; within one file, later lines override
+    earlier ones. A "-attr" line unsets the attribute and "!attr" resets
+    it to the unspecified state, discarding whatever a shallower file
+    said. Directories are additionally matched with a trailing slash so
+    that "dir/" patterns apply to them, as in git.
+    """
+    attrs: dict[bytes, AttributeValue] = {}
+    for base, patterns in attr_stack:
+        if base:
+            if path != base and not path.startswith(base + b"/"):
+                continue
+            rel = path[len(base) :].lstrip(b"/")
+        else:
+            rel = path
+        candidates = [rel, rel + b"/"] if is_dir else [rel]
+        for pattern, pat_attrs in patterns:
+            if any(pattern.match(candidate) for candidate in candidates):
+                for name, value in pat_attrs.items():
+                    if value is None:
+                        # Unspecified: forget any inherited state.
+                        attrs.pop(name, None)
+                    else:
+                        attrs[name] = value
+    return attrs
+
+
+def _attr_is_set(attrs: Mapping[bytes, AttributeValue], name: bytes) -> bool:
+    """Return True if an attribute is set (true or a string value)."""
+    value = attrs.get(name)
+    return value is not None and value is not False
+
+
+_FORMAT_RE = re.compile(rb"\$Format:([^$]*)\$")
+
+
+def _format_author_time(timestamp: int, timezone: int) -> bytes:
+    """Format a commit's author time as strict ISO 8601 (git's %aI)."""
+    tz = datetime.timezone(datetime.timedelta(seconds=timezone))
+    dt = datetime.datetime.fromtimestamp(timestamp, tz)
+    return dt.isoformat().encode("ascii")
+
+
+def _commit_subject(message: bytes) -> bytes:
+    """Return the commit subject (git's %s): first paragraph, lines joined."""
+    paragraph = message.split(b"\n\n", 1)[0]
+    return b" ".join(paragraph.split())
+
+
+def _expand_format(data: bytes, commit: "Commit") -> bytes:
+    """Expand the supported "$Format:...$" placeholders in blob contents.
+
+    Supported placeholders: %H (full commit hash), %h (abbreviated commit
+    hash), %aI (author time, strict ISO 8601), %s (commit subject) and %%
+    (a literal percent sign). A "$Format:...$" string containing any other
+    placeholder is left verbatim, as documented in the module docstring.
+    """
+    full_hash = commit.id
+    placeholders = {
+        b"%H": full_hash,
+        b"%h": full_hash[:7],
+        b"%aI": _format_author_time(commit.author_time, commit.author_timezone),
+        b"%s": _commit_subject(commit.message),
+        b"%%": b"%",
+    }
+
+    def replace(match: re.Match[bytes]) -> bytes:
+        fmt = match.group(1)
+        out = []
+        i = 0
+        while i < len(fmt):
+            if fmt[i : i + 1] == b"%":
+                for token in (b"%aI", fmt[i : i + 2]):
+                    if token == fmt[i : i + len(token)] and token in placeholders:
+                        out.append(placeholders[token])
+                        i += len(token)
+                        break
+                else:
+                    # Unknown placeholder: keep the whole string verbatim.
+                    return match.group(0)
+            else:
+                out.append(fmt[i : i + 1])
+                i += 1
+        return b"".join(out)
+
+    return _FORMAT_RE.sub(replace, data)
 
 
 class ChunkedBytesIO:
@@ -152,6 +306,7 @@ def tar_stream(
     mtime: int,
     prefix: bytes = b"",
     format: str = "",
+    commit: "Commit | None" = None,
 ) -> Generator[bytes, None, None]:
     """Generate a tar stream for the contents of a Git tree.
 
@@ -159,13 +314,28 @@ def tar_stream(
     pieces (bytestrings). To obtain the complete .tar.gz binary file, simply
     concatenate these chunks.
 
+    The "export-ignore" and "export-subst" gitattributes are honoured, read
+    from ".gitattributes" files stored in "tree" itself (never from the
+    working tree). Paths carrying "export-ignore" are omitted, directories
+    included; files carrying "export-subst" get the supported
+    "$Format:...$" placeholders (%H, %h, %aI, %s, %%) expanded, while
+    unknown placeholders are left verbatim. Symbolic links are emitted as
+    tar symlink entries: their targets are neither followed nor
+    substituted.
+
     Args:
       store: Object store to retrieve objects from
       tree: Tree object for the tree root
       mtime: UNIX timestamp that is assigned as the modification time for
         all files, and the gzip header modification time if format='gz'
-      prefix: Optional prefix to prepend to all paths in the archive
+      prefix: Optional prefix to prepend to all paths in the archive. It
+        is not part of the repository and does not affect attribute
+        matching.
       format: Optional compression format for tarball
+      commit: Optional commit to take "$Format:...$" substitution values
+        from. When omitted (tree-only archiving), files marked
+        "export-subst" are archived with their placeholders unexpanded.
+
     Returns:
       Bytestrings
     """
@@ -186,7 +356,7 @@ def tar_stream(
             buf.write(struct.pack("<L", mtime))
             buf.seek(0, SEEK_END)
 
-        for entry_abspath, entry in _walk_tree(store, tree, prefix):
+        for entry_abspath, entry, attrs in _walk_tree(store, tree):
             assert entry.sha is not None
             try:
                 blob = store[entry.sha]
@@ -194,17 +364,44 @@ def tar_stream(
                 # Entry probably refers to a submodule, which we don't yet
                 # support.
                 continue
-            if isinstance(blob, Blob):
-                data = ChunkedBytesIO(blob.chunked)
-            else:
-                # Fallback for objects without chunked attribute
-                data = ChunkedBytesIO([blob.as_raw_string()])
 
+            # The prefix is purely an archive-side name decoration; it must
+            # not influence gitattributes matching, which ran above on the
+            # repo-relative path.
+            if prefix:
+                archive_path = posixpath.join(prefix, entry_abspath)
+            else:
+                archive_path = entry_abspath
             info = tarfile.TarInfo()
             # tarfile only works with ascii.
-            info.name = entry_abspath.decode("utf-8", "surrogateescape")
-            info.size = blob.raw_length()
+            info.name = archive_path.decode("utf-8", "surrogateescape")
+            info.mtime = mtime
             assert entry.mode is not None
+
+            if stat.S_ISLNK(entry.mode):
+                # Symbolic link: keep the tar symlink type, store the blob
+                # contents as the link target, and never dereference or
+                # substitute them.
+                info.type = tarfile.SYMTYPE
+                info.linkname = blob.as_raw_string().decode("utf-8", "surrogateescape")
+                info.mode = 0o777
+                info.size = 0
+                tar.addfile(info)
+                yield buf.getvalue()
+                buf.truncate(0)
+                buf.seek(0)
+                continue
+
+            if isinstance(blob, Blob):
+                chunks: list[bytes] = list(blob.chunked)
+            else:
+                # Fallback for objects without chunked attribute
+                chunks = [blob.as_raw_string()]
+            if commit is not None and _attr_is_set(attrs, b"export-subst"):
+                chunks = [_expand_format(b"".join(chunks), commit)]
+            data = ChunkedBytesIO(chunks)
+
+            info.size = sum(len(chunk) for chunk in chunks)
             # Canonicalize the tree-supplied mode the same way git's archive
             # writer does before emitting a permission field. A crafted tree
             # entry can carry setuid/setgid/sticky or other non-canonical bits
@@ -213,7 +410,6 @@ def tar_stream(
             # regular file to 0o644/0o755 (matching checkout), and masking to the
             # permission bits drops the special bits.
             info.mode = cleanup_mode(entry.mode) & 0o777
-            info.mtime = mtime
 
             tar.addfile(info, data)
             yield buf.getvalue()
@@ -223,25 +419,41 @@ def tar_stream(
 
 
 def _walk_tree(
-    store: "BaseObjectStore", tree: "Tree", root: bytes = b""
-) -> Generator[tuple[bytes, "TreeEntry"], None, None]:
-    """Recursively walk a dulwich Tree, yielding tuples of (absolute path, TreeEntry) along the way.
+    store: "BaseObjectStore",
+    tree: "Tree",
+    root: bytes = b"",
+    attr_stack: _AttrStack = (),
+) -> Generator[tuple[bytes, "TreeEntry", dict[bytes, AttributeValue]], None, None]:
+    """Recursively walk a dulwich Tree, yielding (path, TreeEntry, attributes).
+
+    Paths are repo-relative (the archive prefix is not involved), and the
+    attributes are resolved from the ".gitattributes" files stored in the
+    walked trees. Entries whose attributes set "export-ignore" are skipped;
+    for a directory that drops the whole subtree.
 
     Raises:
       UnsafeArchivePathError: if a tree entry's name is unsafe to emit into
         an archive (matches the spirit of git's ``verify_path`` /
         ``error: invalid path``).
     """
+    patterns = _tree_gitattributes(store, tree)
+    if patterns:
+        attr_stack = [*attr_stack, (root, patterns)]
     for entry in tree.iteritems():
         assert entry.path is not None
         if _is_unsafe_archive_path(entry.path):
             raise UnsafeArchivePathError(entry.path)
         entry_abspath = posixpath.join(root, entry.path)
         assert entry.mode is not None
+        attrs = _match_attrs(attr_stack, entry_abspath, stat.S_ISDIR(entry.mode))
+        if _attr_is_set(attrs, b"export-ignore"):
+            # Ignored files are dropped; an ignored directory takes its
+            # whole subtree with it.
+            continue
         if stat.S_ISDIR(entry.mode):
             assert entry.sha is not None
             subtree = store[entry.sha]
             if isinstance(subtree, Tree):
-                yield from _walk_tree(store, subtree, entry_abspath)
+                yield from _walk_tree(store, subtree, entry_abspath, attr_stack)
         else:
-            yield (entry_abspath, entry)
+            yield (entry_abspath, entry, attrs)

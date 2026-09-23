@@ -1,5 +1,16 @@
 1.2.16	UNRELEASED
 
+ * Honour the ``export-ignore`` and ``export-subst`` gitattributes when
+   generating archives. ``tar_stream`` (and therefore ``porcelain.archive``
+   and ``git upload-archive``) now reads ``.gitattributes`` files from the
+   tree being archived rather than the working tree, omits paths marked
+   ``export-ignore`` (dropping ignored directories wholesale), and expands
+   the ``$Format:%H$``, ``$Format:%h$``, ``$Format:%aI$`` and
+   ``$Format:%s$`` placeholders in files marked ``export-subst`` when a
+   commit is available; unknown placeholders and tree-only archives are
+   left verbatim. Symbolic links are now emitted as tar symlink entries
+   instead of regular files.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and

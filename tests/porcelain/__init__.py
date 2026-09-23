@@ -391,6 +391,66 @@ class ArchiveTests(PorcelainTestCase):
         self.assertEqual(b"tar data", out.getvalue())
         self.assertEqual(b"", err.getvalue())
 
+    def test_export_attributes_come_from_commit_not_worktree(self) -> None:
+        """export-ignore/export-subst are read from the archived commit.
+
+        The working tree carries a contradicting .gitattributes that
+        un-ignores the test data and disables substitution; the archive
+        must follow the committed attributes instead, and neither the
+        working tree nor the stored objects may be modified.
+        """
+        store = self.repo.object_store
+        attrs = Blob.from_string(b"VERSION export-subst\ntestdata/ export-ignore\n")
+        store.add_object(attrs)
+        version = Blob.from_string(b"commit $Format:%H$\n")
+        store.add_object(version)
+        testdata_blob = Blob.from_string(b"test data\n")
+        store.add_object(testdata_blob)
+        testdata_tree = Tree()
+        testdata_tree.add(b"data.txt", 0o100644, testdata_blob.id)
+        store.add_object(testdata_tree)
+        tree = Tree()
+        tree.add(b".gitattributes", 0o100644, attrs.id)
+        tree.add(b"VERSION", 0o100644, version.id)
+        tree.add(b"testdata", 0o040000, testdata_tree.id)
+        store.add_object(tree)
+        commit = Commit()
+        commit.tree = tree.id
+        commit.author = commit.committer = b"A U Thor <author@example.com>"
+        commit.author_time = commit.commit_time = 1234567890
+        commit.author_timezone = commit.commit_timezone = 0
+        commit.message = b"Release v1\n"
+        store.add_object(commit)
+        self.repo.refs[b"refs/heads/master"] = commit.id
+
+        # The contradicting working-tree .gitattributes must be ignored.
+        worktree_attrs = os.path.join(self.repo.path, ".gitattributes")
+        with open(worktree_attrs, "wb") as f:
+            f.write(b"VERSION -export-subst\ntestdata/ -export-ignore\n")
+
+        out = BytesIO()
+        err = BytesIO()
+        porcelain.archive(
+            self.repo.path, b"refs/heads/master", outstream=out, errstream=err
+        )
+        self.assertEqual(b"", err.getvalue())
+        out.seek(0)
+        tf = tarfile.TarFile(fileobj=out)
+        self.addCleanup(tf.close)
+        # testdata/ stays ignored and VERSION stays substituted, per the
+        # committed attributes.
+        self.assertEqual([".gitattributes", "VERSION"], tf.getnames())
+        self.assertEqual(
+            b"commit " + commit.id + b"\n", tf.extractfile("VERSION").read()
+        )
+        # Neither the working tree nor the stored objects were modified.
+        with open(worktree_attrs, "rb") as f:
+            self.assertEqual(
+                b"VERSION -export-subst\ntestdata/ -export-ignore\n", f.read()
+            )
+        self.assertEqual(b"commit $Format:%H$\n", store[version.id].data)
+        self.assertEqual(tree.id, store[commit.id].tree)
+
 
 class UpdateServerInfoTests(PorcelainTestCase):
     def test_simple(self) -> None:
