@@ -150,6 +150,87 @@ class MissingCommitError(Exception):
         Exception.__init__(self, f"{sha.decode('ascii')} is not in the revision store")
 
 
+def _format_replace_chain(chain: list[bytes]) -> str:
+    """Format a replacement chain for error messages."""
+    return " -> ".join(sha.decode("ascii") for sha in chain)
+
+
+class ReplacementError(Exception):
+    """Indicates that a refs/replace/ chain could not be resolved."""
+
+    def __init__(self, chain: list[bytes], *args: object) -> None:
+        """Initialize a ReplacementError.
+
+        Args:
+            chain: The full chain of object SHAs that was followed,
+              starting with the originally requested object.
+            *args: Additional positional arguments.
+        """
+        self.chain = list(chain)
+        if not args:
+            args = (f"replacement chain {_format_replace_chain(self.chain)}",)
+        Exception.__init__(self, *args)
+
+
+class MissingReplacementTarget(ReplacementError):
+    """Indicates that a replacement ref points at a missing object."""
+
+    def __init__(self, chain: list[bytes]) -> None:
+        """Initialize a MissingReplacementTarget.
+
+        Args:
+            chain: The full chain of object SHAs that was followed; the last
+              entry is the missing target.
+        """
+        self.chain = list(chain)
+        Exception.__init__(
+            self,
+            f"replacement target {self.chain[-1].decode('ascii')} is missing "
+            f"(chain: {_format_replace_chain(self.chain)})",
+        )
+
+
+class ReplacementTypeMismatch(ReplacementError):
+    """Indicates that a replacement object has a different type."""
+
+    def __init__(
+        self, chain: list[bytes], expected_type: bytes, actual_type: bytes
+    ) -> None:
+        """Initialize a ReplacementTypeMismatch.
+
+        Args:
+            chain: The full chain of object SHAs that was followed.
+            expected_type: Type name of the originally requested object.
+            actual_type: Type name of the replacement object.
+        """
+        self.chain = list(chain)
+        self.expected_type = expected_type
+        self.actual_type = actual_type
+        Exception.__init__(
+            self,
+            f"replacement object has type {actual_type.decode('ascii')}, "
+            f"expected {expected_type.decode('ascii')} "
+            f"(chain: {_format_replace_chain(self.chain)})",
+        )
+
+
+class ReplacementCycle(ReplacementError):
+    """Indicates that a refs/replace/ chain contains a cycle."""
+
+    def __init__(self, chain: list[bytes]) -> None:
+        """Initialize a ReplacementCycle.
+
+        Args:
+            chain: The full chain of object SHAs that was followed; the last
+              entry repeats an earlier entry.
+        """
+        self.chain = list(chain)
+        Exception.__init__(
+            self,
+            f"replacement chain contains a cycle: {_format_replace_chain(self.chain)}",
+        )
+
+
 class ObjectMissing(Exception):
     """Indicates that a requested object is missing."""
 

@@ -44,6 +44,7 @@ __all__ = [
     "PackCapableObjectStore",
     "PackContainer",
     "PackInputTooLarge",
+    "ReplacementObjectStore",
     "commit_tree_changes",
     "find_shallow",
     "get_depth",
@@ -83,8 +84,15 @@ from typing import (
 
 if TYPE_CHECKING:
     from .object_format import ObjectFormat
+    from .refs import RefsContainer
 
-from .errors import NotTreeError
+from .errors import (
+    MissingReplacementTarget,
+    NotTreeError,
+    ReplacementCycle,
+    ReplacementError,
+    ReplacementTypeMismatch,
+)
 from .file import GitFile, SharedPerm, _GitFile, adjust_shared_perm
 from .lru_cache import LRUCache
 from .midx import MultiPackIndex, load_midx
@@ -3715,6 +3723,299 @@ class OverlayObjectStore(BaseObjectStore):
             if b.contains_loose(sha):
                 return True
         return False
+
+
+def _type_name(type_num: int) -> bytes:
+    """Return the type name for a numeric object type."""
+    cls = object_class(type_num)
+    return cls.type_name if cls is not None else b"unknown"
+
+
+class ReplacementObjectStore(BaseObjectStore):
+    """Read-only view of an object store that honors refs/replace/ refs.
+
+    Objects are always stored in and retrieved from the underlying store
+    by their real object id. When a replacement mapping exists for a
+    requested id, the content of the replacement object is returned
+    instead, while the logical identity of the returned object remains
+    the originally requested id. This lets history walkers, tree reads
+    and annotation see the replaced content without rewriting parent
+    relations or bookmarks to a different history.
+
+    The view is read-only: it never modifies the underlying store, packs,
+    refs or object hashes, and the iteration/transfer operations used by
+    push and fetch only ever see the real objects.
+    """
+
+    def __init__(
+        self,
+        base_store: BaseObjectStore,
+        replacements: Mapping[ObjectID, ObjectID] | None = None,
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """Initialize a ReplacementObjectStore.
+
+        Args:
+          base_store: The underlying object store holding the real objects.
+          replacements: Mapping of object id to replacement object id,
+            as recorded under refs/replace/. The mapping is fixed for the
+            lifetime of this view.
+          enabled: Whether replacements are applied. When disabled, the
+            view behaves exactly like the underlying store.
+        """
+        super().__init__(object_format=base_store.object_format)
+        self.base_store = base_store
+        self._replacements: dict[ObjectID, ObjectID] = {
+            ObjectID(k): ObjectID(v) for (k, v) in (replacements or {}).items()
+        }
+        self._enabled = bool(enabled)
+        # Resolution results are cached per view instance; the cache is
+        # keyed on the fixed replacement mapping and is dropped whenever
+        # the view is enabled or disabled, so two views over the same
+        # underlying store can never observe each other's results.
+        self._resolution_cache: dict[ObjectID, tuple[ObjectID, ...]] = {}
+
+    @classmethod
+    def from_refs(
+        cls,
+        base_store: BaseObjectStore,
+        refs: "RefsContainer",
+        *,
+        enabled: bool = True,
+    ) -> "ReplacementObjectStore":
+        """Build a replacement view from the refs/replace/ refs of a repo.
+
+        Args:
+          base_store: The underlying object store holding the real objects.
+          refs: Refs container to read refs/replace/ mappings from.
+          enabled: Whether replacements are applied.
+
+        Returns:
+          A ReplacementObjectStore over base_store.
+        """
+        from .refs import LOCAL_REPLACE_PREFIX
+
+        replacements: dict[ObjectID, ObjectID] = {}
+        for ref, target in refs.as_dict().items():
+            if ref.startswith(LOCAL_REPLACE_PREFIX):
+                replacements[ObjectID(ref[len(LOCAL_REPLACE_PREFIX) :])] = target
+        return cls(base_store, replacements, enabled=enabled)
+
+    @property
+    def replacements(self) -> dict[ObjectID, ObjectID]:
+        """The fixed replacement mapping used by this view."""
+        return dict(self._replacements)
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this view applies replacements."""
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        value = bool(value)
+        if value != self._enabled:
+            self._enabled = value
+            self._resolution_cache.clear()
+            self._invalidate_peel_cache()
+
+    def _to_hexsha(self, sha: ObjectID | RawObjectID) -> ObjectID:
+        if len(sha) == self.object_format.hex_length:
+            return cast(ObjectID, sha)
+        elif len(sha) == self.object_format.oid_length:
+            return sha_to_hex(cast(RawObjectID, sha))
+        else:
+            raise ValueError(f"Invalid sha {sha!r}")
+
+    def _follow(self, hexsha: ObjectID) -> tuple[ObjectID, ...]:
+        """Resolve the replacement chain for a hex sha.
+
+        Args:
+          hexsha: Hex object id to resolve.
+
+        Returns:
+          Tuple of object ids starting with hexsha and ending with the id
+          of the object whose content should actually be read.
+
+        Raises:
+          MissingReplacementTarget: A replacement target is not present
+            in the underlying store.
+          ReplacementCycle: The replacement chain contains a cycle.
+        """
+        cached = self._resolution_cache.get(hexsha)
+        if cached is not None:
+            return cached
+        chain = [hexsha]
+        seen = {hexsha}
+        current = hexsha
+        while current in self._replacements:
+            nxt = self._replacements[current]
+            chain.append(nxt)
+            if nxt in seen:
+                raise ReplacementCycle(chain)
+            if nxt not in self.base_store:
+                raise MissingReplacementTarget(chain)
+            seen.add(nxt)
+            current = nxt
+        result = tuple(chain)
+        self._resolution_cache[hexsha] = result
+        return result
+
+    def replacement_chain(self, sha: ObjectID | RawObjectID) -> tuple[ObjectID, ...]:
+        """Return the replacement chain for an object id.
+
+        Args:
+          sha: Object id to resolve.
+
+        Returns:
+          Tuple of object ids starting with the requested id and ending
+          with the id of the object whose content is actually read. When
+          the view is disabled or no replacement exists, this is just the
+          requested id.
+        """
+        hexsha = self._to_hexsha(sha)
+        if not self._enabled or hexsha not in self._replacements:
+            return (hexsha,)
+        return self._follow(hexsha)
+
+    def resolve(self, sha: ObjectID | RawObjectID) -> ObjectID:
+        """Return the id of the object whose content is actually read.
+
+        Args:
+          sha: Object id to resolve.
+
+        Returns:
+          The final id in the replacement chain for sha.
+        """
+        return self.replacement_chain(sha)[-1]
+
+    def _check_replacement_type(
+        self, chain: tuple[ObjectID, ...], replacement_type_num: int
+    ) -> None:
+        original = chain[0]
+        try:
+            original_type_num = self.base_store.get_raw(original)[0]
+        except KeyError:
+            # The original object is not present; there is no type to
+            # check the replacement against.
+            return
+        if original_type_num != replacement_type_num:
+            raise ReplacementTypeMismatch(
+                list(chain),
+                _type_name(original_type_num),
+                _type_name(replacement_type_num),
+            )
+
+    def get_raw(self, name: RawObjectID | ObjectID) -> tuple[int, bytes]:
+        """Obtain the raw text for an object, applying replacements.
+
+        Args:
+          name: sha for the object.
+        Returns: tuple with numeric type and object contents.
+        """
+        hexsha = self._to_hexsha(name)
+        if not self._enabled or hexsha not in self._replacements:
+            return self.base_store.get_raw(name)
+        chain = self._follow(hexsha)
+        type_num, uncomp = self.base_store.get_raw(chain[-1])
+        self._check_replacement_type(chain, type_num)
+        return type_num, uncomp
+
+    def __getitem__(self, sha: ObjectID | RawObjectID) -> ShaFile:
+        """Obtain an object by SHA, applying replacements.
+
+        The returned object carries the content of the replacement object
+        but keeps the requested (original) id as its logical identity.
+        """
+        hexsha = self._to_hexsha(sha)
+        if not self._enabled or hexsha not in self._replacements:
+            return self.base_store[sha]
+        type_num, uncomp = self.get_raw(hexsha)
+        return ShaFile.from_raw_string(
+            type_num, uncomp, sha=hexsha, object_format=self.object_format
+        )
+
+    def __contains__(  # type: ignore[override]
+        self, sha: ObjectID | RawObjectID
+    ) -> bool:
+        """Check if an object can be read through this view."""
+        try:
+            hexsha = self._to_hexsha(sha)
+        except ValueError:
+            return False
+        if hexsha in self.base_store:
+            return True
+        if self._enabled and hexsha in self._replacements:
+            try:
+                self._follow(hexsha)
+            except ReplacementError:
+                return False
+            return True
+        return False
+
+    def __iter__(self) -> Iterator[ObjectID]:
+        """Iterate over the real object ids in the underlying store."""
+        return iter(self.base_store)
+
+    def contains_loose(self, sha: ObjectID) -> bool:
+        """Check if a particular object is present and loose."""
+        return self.base_store.contains_loose(sha)
+
+    def contains_packed(self, sha: ObjectID | RawObjectID) -> bool:
+        """Check if a particular object is present and packed."""
+        return self.base_store.contains_packed(sha)
+
+    @property
+    def packs(self) -> list[Pack]:
+        """Iterable with pack objects of the underlying store."""
+        return self.base_store.packs
+
+    def add_object(self, obj: ShaFile) -> None:
+        """Add a single object to this store.
+
+        Raises:
+          NotImplementedError: This view is read-only.
+        """
+        raise NotImplementedError(self.add_object)
+
+    def add_objects(
+        self,
+        objects: Sequence[tuple[ShaFile, str | None]],
+        progress: Callable[[str], None] | None = None,
+    ) -> "Pack | None":
+        """Add a set of objects to this store.
+
+        Raises:
+          NotImplementedError: This view is read-only.
+        """
+        raise NotImplementedError(self.add_objects)
+
+    def iterobjects_subset(
+        self, shas: Iterable[ObjectID], *, allow_missing: bool = False
+    ) -> Iterator[ShaFile]:
+        """Iterate over real objects, ignoring replacements.
+
+        Replacements are a read-side view only; transfer operations must
+        not propagate replacement content under another object's id.
+        """
+        return self.base_store.iterobjects_subset(shas, allow_missing=allow_missing)
+
+    def iter_unpacked_subset(
+        self,
+        shas: Iterable[ObjectID | RawObjectID],
+        *,
+        include_comp: bool = False,
+        allow_missing: bool = False,
+        convert_ofs_delta: bool = True,
+    ) -> Iterator[UnpackedObject]:
+        """Iterate over real unpacked objects, ignoring replacements."""
+        return self.base_store.iter_unpacked_subset(
+            shas,
+            include_comp=include_comp,
+            allow_missing=allow_missing,
+            convert_ofs_delta=convert_ofs_delta,
+        )
 
 
 def read_packs_file(f: BinaryIO) -> Iterator[str]:

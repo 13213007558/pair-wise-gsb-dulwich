@@ -33,8 +33,16 @@ from io import BytesIO
 from unittest.mock import patch
 
 import dulwich.pack
+from dulwich.annotate import annotate_lines
 from dulwich.config import ConfigDict
-from dulwich.errors import ChecksumMismatch, NotTreeError, ObjectFormatException
+from dulwich.errors import (
+    ChecksumMismatch,
+    MissingReplacementTarget,
+    NotTreeError,
+    ObjectFormatException,
+    ReplacementCycle,
+    ReplacementTypeMismatch,
+)
 from dulwich.file import GitFile
 from dulwich.gc import garbage_collect
 from dulwich.index import commit_tree
@@ -48,6 +56,7 @@ from dulwich.object_store import (
     ObjectStoreGraphWalker,
     OverlayObjectStore,
     PackInputTooLarge,
+    ReplacementObjectStore,
     commit_tree_changes,
     find_shallow,
     get_depth,
@@ -72,9 +81,11 @@ from dulwich.pack import (
     load_pack_index,
     write_pack_objects,
 )
+from dulwich.refs import DictRefsContainer
 from dulwich.repo import Repo
 from dulwich.tests.test_object_store import ObjectStoreTests, PackBasedObjectStoreTests
-from dulwich.tests.utils import build_pack, make_object, make_tag
+from dulwich.tests.utils import build_pack, make_commit, make_object, make_tag
+from dulwich.walk import Walker
 
 from . import TestCase
 
@@ -1934,3 +1945,325 @@ class TestReadPacksFile(TestCase):
                 )
             ),
         )
+
+
+class ReplacementObjectStoreTests(TestCase):
+    """Tests for ReplacementObjectStore."""
+
+    def setUp(self) -> None:
+        TestCase.setUp(self)
+        self.base = MemoryObjectStore()
+
+    def add_blob(self, data: bytes) -> Blob:
+        blob = make_object(Blob, data=data)
+        self.base.add_object(blob)
+        return blob
+
+    def add_tree(self, entries: list[tuple[bytes, int, bytes]]) -> Tree:
+        tree = Tree()
+        for name, mode, sha in entries:
+            tree.add(name, mode, sha)
+        self.base.add_object(tree)
+        return tree
+
+    def add_commit(
+        self,
+        tree: Tree,
+        parents: tuple[Commit, ...] = (),
+        message: bytes = b"message",
+        timestamp: int = 1,
+    ) -> Commit:
+        commit = make_commit(
+            tree=tree.id,
+            parents=[parent.id for parent in parents],
+            message=message,
+            commit_time=timestamp,
+            author_time=timestamp,
+        )
+        self.base.add_object(commit)
+        return commit
+
+    def test_blob_replacement(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+
+        replaced = view[old.id]
+        self.assertEqual(b"new data", replaced.data)
+        # The logical identity remains the original id.
+        self.assertEqual(old.id, replaced.id)
+        # The actual content id is reported alongside.
+        self.assertEqual(new.id, view.resolve(old.id))
+        self.assertEqual((old.id, new.id), view.replacement_chain(old.id))
+        self.assertEqual((new.type_num, new.as_raw_string()), view.get_raw(old.id))
+        # The underlying store still serves the real object.
+        self.assertEqual(b"old data", self.base[old.id].data)
+
+    def test_blob_replacement_raw_sha(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+
+        raw_sha = hex_to_sha(old.id)
+        replaced = view[raw_sha]
+        self.assertEqual(b"new data", replaced.data)
+        self.assertEqual(old.id, replaced.id)
+        self.assertEqual((new.type_num, new.as_raw_string()), view.get_raw(raw_sha))
+
+    def test_tree_replacement(self) -> None:
+        old_blob = self.add_blob(b"old data")
+        new_blob = self.add_blob(b"new data")
+        old_tree = self.add_tree([(b"a", 0o100644, old_blob.id)])
+        new_tree = self.add_tree([(b"a", 0o100644, new_blob.id)])
+        view = ReplacementObjectStore(self.base, {old_tree.id: new_tree.id})
+
+        replaced = view[old_tree.id]
+        self.assertEqual(old_tree.id, replaced.id)
+        _mode, sha = tree_lookup_path(view.__getitem__, old_tree.id, b"a")
+        self.assertEqual(new_blob.id, sha)
+        self.assertEqual(b"new data", view[sha].data)
+        # The real tree is still reachable by its own id.
+        self.assertEqual(
+            old_blob.id,
+            tree_lookup_path(self.base.__getitem__, old_tree.id, b"a")[1],
+        )
+
+    def test_commit_replacement(self) -> None:
+        tree = self.add_tree([])
+        old_parent = self.add_commit(tree, message=b"old parent", timestamp=1)
+        new_parent = self.add_commit(tree, message=b"new parent", timestamp=1)
+        old = self.add_commit(tree, parents=(old_parent,), message=b"old", timestamp=2)
+        new = self.add_commit(tree, parents=(new_parent,), message=b"new", timestamp=2)
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+
+        replaced = view[old.id]
+        self.assertEqual(old.id, replaced.id)
+        self.assertEqual(b"new", replaced.message)
+        self.assertEqual([new_parent.id], replaced.parents)
+        # The underlying store still has the real commit.
+        self.assertEqual([old_parent.id], self.base[old.id].parents)
+
+    def test_multi_hop_chain(self) -> None:
+        first = self.add_blob(b"first")
+        second = self.add_blob(b"second")
+        third = self.add_blob(b"third")
+        view = ReplacementObjectStore(
+            self.base, {first.id: second.id, second.id: third.id}
+        )
+
+        self.assertEqual(b"third", view[first.id].data)
+        self.assertEqual(first.id, view[first.id].id)
+        self.assertEqual(third.id, view.resolve(first.id))
+        self.assertEqual(
+            (first.id, second.id, third.id), view.replacement_chain(first.id)
+        )
+        # Intermediate hops resolve to the end of the chain as well.
+        self.assertEqual(b"third", view[second.id].data)
+
+    def test_missing_target_reports_chain(self) -> None:
+        blob = self.add_blob(b"data")
+        other = self.add_blob(b"other")
+        missing = b"f" * 40
+        view = ReplacementObjectStore(self.base, {blob.id: other.id, other.id: missing})
+
+        with self.assertRaises(MissingReplacementTarget) as cm:
+            view[blob.id]
+        self.assertEqual([blob.id, other.id, missing], cm.exception.chain)
+        self.assertIn(missing.decode("ascii"), str(cm.exception))
+
+    def test_type_mismatch_reports_chain(self) -> None:
+        tree = self.add_tree([])
+        commit = self.add_commit(tree)
+        blob = self.add_blob(b"not a commit")
+        view = ReplacementObjectStore(self.base, {commit.id: blob.id})
+
+        with self.assertRaises(ReplacementTypeMismatch) as cm:
+            view[commit.id]
+        self.assertEqual([commit.id, blob.id], cm.exception.chain)
+        self.assertEqual(b"commit", cm.exception.expected_type)
+        self.assertEqual(b"blob", cm.exception.actual_type)
+
+    def test_cycle_reports_chain(self) -> None:
+        first = self.add_blob(b"first")
+        second = self.add_blob(b"second")
+        view = ReplacementObjectStore(
+            self.base, {first.id: second.id, second.id: first.id}
+        )
+
+        with self.assertRaises(ReplacementCycle) as cm:
+            view[first.id]
+        self.assertEqual([first.id, second.id, first.id], cm.exception.chain)
+
+    def test_disabled_view_sees_original_content(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+
+        self.assertEqual(b"new data", view[old.id].data)
+        view.enabled = False
+        self.assertEqual(b"old data", view[old.id].data)
+        self.assertEqual(old.id, view.resolve(old.id))
+        # Re-enabling applies replacements again; no stale cached results.
+        view.enabled = True
+        self.assertEqual(b"new data", view[old.id].data)
+
+    def test_disabled_at_construction(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id}, enabled=False)
+        self.assertEqual(b"old data", view[old.id].data)
+
+    def test_two_views_do_not_share_results(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        other = self.add_blob(b"other data")
+        replacing = ReplacementObjectStore(self.base, {old.id: new.id})
+        plain = ReplacementObjectStore(self.base, {})
+        differently = ReplacementObjectStore(self.base, {old.id: other.id})
+
+        self.assertEqual(b"new data", replacing[old.id].data)
+        self.assertEqual(b"old data", plain[old.id].data)
+        self.assertEqual(b"other data", differently[old.id].data)
+        # Toggling one view does not affect the others.
+        replacing.enabled = False
+        self.assertEqual(b"old data", replacing[old.id].data)
+        self.assertEqual(b"other data", differently[old.id].data)
+        self.assertEqual(b"old data", self.base[old.id].data)
+
+    def test_read_only(self) -> None:
+        blob = self.add_blob(b"data")
+        view = ReplacementObjectStore(self.base, {})
+        with self.assertRaises(NotImplementedError):
+            view.add_object(blob)
+        with self.assertRaises(NotImplementedError):
+            view.add_objects([(blob, None)])
+
+    def test_iteration_yields_real_ids(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+        self.assertEqual(set(self.base), set(view))
+
+    def test_contains(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        view = ReplacementObjectStore(self.base, {old.id: new.id})
+        self.assertIn(old.id, view)
+        self.assertNotIn(b"0" * 40, view)
+        # An object that only exists through a replacement is contained.
+        missing_original = b"1" * 40
+        view = ReplacementObjectStore(self.base, {missing_original: new.id})
+        self.assertIn(missing_original, view)
+        # A replacement chain that cannot be resolved is not contained.
+        view = ReplacementObjectStore(self.base, {missing_original: b"f" * 40})
+        self.assertNotIn(missing_original, view)
+
+    def test_from_refs(self) -> None:
+        old = self.add_blob(b"old data")
+        new = self.add_blob(b"new data")
+        refs = DictRefsContainer(
+            {
+                b"refs/heads/master": new.id,
+                b"refs/replace/" + old.id: new.id,
+            }
+        )
+        view = ReplacementObjectStore.from_refs(self.base, refs)
+        self.assertEqual({old.id: new.id}, view.replacements)
+        self.assertEqual(b"new data", view[old.id].data)
+
+    def _build_replaced_history(self):
+        """Build a history where an old commit gets new parents.
+
+        c_head -> c_old -> c_base is the real history; c_old is replaced
+        by c_new, which has c_alt as its (different) parent and different
+        file contents.
+        """
+        base_blob = self.add_blob(b"line1\n")
+        old_blob = self.add_blob(b"line1\norig\n")
+        new_blob = self.add_blob(b"line1\nchanged\n")
+        head_blob = self.add_blob(b"line1\nchanged\nline3\n")
+        base_tree = self.add_tree([(b"a", 0o100644, base_blob.id)])
+        old_tree = self.add_tree([(b"a", 0o100644, old_blob.id)])
+        new_tree = self.add_tree([(b"a", 0o100644, new_blob.id)])
+        head_tree = self.add_tree([(b"a", 0o100644, head_blob.id)])
+        c_base = self.add_commit(base_tree, message=b"base", timestamp=1)
+        c_alt = self.add_commit(base_tree, message=b"alt root", timestamp=1)
+        c_old = self.add_commit(
+            old_tree, parents=(c_base,), message=b"old", timestamp=2
+        )
+        c_new = self.add_commit(new_tree, parents=(c_alt,), message=b"new", timestamp=2)
+        c_head = self.add_commit(
+            head_tree, parents=(c_old,), message=b"head", timestamp=3
+        )
+        view = ReplacementObjectStore(self.base, {c_old.id: c_new.id})
+        return view, c_base, c_alt, c_old, c_new, c_head, new_tree, new_blob
+
+    def test_walker_follows_replaced_parents(self) -> None:
+        view, _c_base, c_alt, c_old, c_new, c_head, new_tree, new_blob = (
+            self._build_replaced_history()
+        )
+
+        entries = list(Walker(view, [c_head.id]))
+        # The walker follows the replacement parents, but the logical
+        # commit identity stays the original id.
+        self.assertEqual(
+            [c_head.id, c_old.id, c_alt.id], [e.commit.id for e in entries]
+        )
+        replaced_entry = entries[1]
+        self.assertEqual([c_alt.id], replaced_entry.commit.parents)
+        self.assertEqual(b"new", replaced_entry.commit.message)
+        # The actual content id is available alongside the logical id.
+        self.assertEqual(c_new.id, view.resolve(replaced_entry.commit.id))
+        self.assertEqual(
+            (c_old.id, c_new.id),
+            view.replacement_chain(replaced_entry.commit.id),
+        )
+        # Tree reads through the view see the replacement content.
+        self.assertEqual(new_tree.id, replaced_entry.commit.tree)
+        _mode, sha = tree_lookup_path(view.__getitem__, new_tree.id, b"a")
+        self.assertEqual(new_blob.id, sha)
+        self.assertEqual(b"line1\nchanged\n", view[sha].data)
+
+    def test_walker_disabled_view_uses_real_parents(self) -> None:
+        view, c_base, _c_alt, c_old, _c_new, c_head, _new_tree, _new_blob = (
+            self._build_replaced_history()
+        )
+        view.enabled = False
+        entries = list(Walker(view, [c_head.id]))
+        self.assertEqual(
+            [c_head.id, c_old.id, c_base.id], [e.commit.id for e in entries]
+        )
+        self.assertEqual([c_base.id], entries[1].commit.parents)
+
+    def test_annotate_attributes_lines_to_logical_ids(self) -> None:
+        view, _c_base, c_alt, c_old, _c_new, c_head, _new_tree, _new_blob = (
+            self._build_replaced_history()
+        )
+
+        annotated = annotate_lines(view, c_head.id, b"a")
+        self.assertEqual(
+            [
+                (c_alt.id, b"line1\n"),
+                (c_old.id, b"changed\n"),
+                (c_head.id, b"line3\n"),
+            ],
+            [(commit.id, line) for ((commit, entry), line) in annotated],
+        )
+
+    def test_original_object_bytes_unchanged(self) -> None:
+        view, c_base, _c_alt, c_old, c_new, c_head, _new_tree, _new_blob = (
+            self._build_replaced_history()
+        )
+        original_raw = self.base.get_raw(c_old.id)
+
+        # Exercise the view thoroughly.
+        list(Walker(view, [c_head.id]))
+        annotate_lines(view, c_head.id, b"a")
+        view[c_old.id]
+
+        # The real object is still stored under its own id, byte for byte.
+        self.assertEqual(original_raw, self.base.get_raw(c_old.id))
+        self.assertEqual(c_old.as_raw_string(), self.base.get_raw(c_old.id)[1])
+        self.assertEqual([c_base.id], self.base[c_old.id].parents)
+        # The view reports the replacement content for the same id.
+        self.assertEqual(c_new.as_raw_string(), view.get_raw(c_old.id)[1])

@@ -1,5 +1,11 @@
 1.2.16	UNRELEASED
 
+ * Add ``object_store.ReplacementObjectStore``, a read-only view over an
+   object store that applies ``refs/replace/`` mappings when reading, so
+   log, tree reads and annotate see replacement content while the
+   underlying store keeps serving the real objects by their original ids.
+   (Jelmer Vernooĳ)
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and
