@@ -28,6 +28,7 @@ __all__ = [
     "Pattern",
     "compile_gitattributes_patterns",
     "match_path",
+    "match_path_hierarchical",
     "parse_git_attributes",
     "parse_gitattributes_file",
     "read_gitattributes",
@@ -192,6 +193,58 @@ def match_path(
                     attributes.pop(name, None)
                 else:
                     attributes[name] = value
+
+    return attributes
+
+
+def match_path_hierarchical(
+    sources: Iterable[
+        tuple[bytes, Sequence[tuple[Pattern, Mapping[bytes, AttributeValue]]]]
+    ],
+    path: bytes,
+) -> dict[bytes, AttributeValue]:
+    """Match a path against gitattributes patterns from a directory hierarchy.
+
+    This mirrors git's rules for combining ``.gitattributes`` files found at
+    different directory levels:
+
+    * Patterns from a ``.gitattributes`` file apply to paths beneath the
+      directory containing that file, and are matched relative to it.
+    * Deeper files override shallower ones, and within a single file later
+      lines override earlier ones.
+    * ``-attr`` explicitly unsets an attribute (value ``False``), while
+      ``!attr`` resets it to the *unspecified* state, as if no pattern had
+      ever mentioned it.
+
+    Args:
+        sources: ``(directory, patterns)`` pairs ordered from the repository
+            root downwards. ``directory`` is the repo-relative directory the
+            patterns were loaded from (``b""`` for the repository root).
+        path: Repo-relative path to match.
+
+    Returns:
+        Dictionary of attributes that apply to this path
+    """
+    attributes: dict[bytes, AttributeValue] = {}
+
+    for directory, patterns in sources:
+        if directory:
+            # A directory's own .gitattributes only applies to paths beneath
+            # it, never to the directory itself.
+            if not path.startswith(directory + b"/"):
+                continue
+            relpath = path[len(directory) + 1 :]
+        else:
+            relpath = path
+        for pattern, attrs in patterns:
+            if pattern.match(relpath):
+                # Later (deeper) sources override earlier ones.
+                for name, value in attrs.items():
+                    if value is None:
+                        # Unspecified - remove the attribute
+                        attributes.pop(name, None)
+                    else:
+                        attributes[name] = value
 
     return attributes
 

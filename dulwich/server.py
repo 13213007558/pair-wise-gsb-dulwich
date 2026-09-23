@@ -1822,6 +1822,7 @@ class UploadArchiveHandler(Handler):
         i = 0
         store: BaseObjectStore = self.repo.object_store
         tree: Tree | None = None
+        commit_obj: Commit | None = None
         while i < len(arguments):
             argument = arguments[i]
             if argument == b"--prefix":
@@ -1832,8 +1833,9 @@ class UploadArchiveHandler(Handler):
                 format = arguments[i].decode("ascii")
             else:
                 commit_sha = self.repo.refs[Ref(argument)]
-                commit_obj = store[commit_sha]
-                assert isinstance(commit_obj, Commit)
+                obj = store[commit_sha]
+                assert isinstance(obj, Commit)
+                commit_obj = obj
                 tree_obj = store[commit_obj.tree]
                 assert isinstance(tree_obj, Tree)
                 tree = tree_obj
@@ -1848,6 +1850,7 @@ class UploadArchiveHandler(Handler):
             mtime=int(time.time()),
             prefix=prefix,
             format=format,
+            commit=commit_obj,
         ):
             write(chunk)
         self.proto.write_pkt_line(None)

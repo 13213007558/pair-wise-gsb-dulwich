@@ -391,6 +391,97 @@ class ArchiveTests(PorcelainTestCase):
         self.assertEqual(b"tar data", out.getvalue())
         self.assertEqual(b"", err.getvalue())
 
+    def test_export_attributes_come_from_commit_not_worktree(self) -> None:
+        """Archive honours committed .gitattributes, not the worktree's.
+
+        The committed attributes export-ignore the test data directory and
+        export-subst the VERSION file; the worktree .gitattributes is then
+        rewritten to say the exact opposite. The generated archive must
+        reflect the committed attributes, and neither the worktree nor the
+        stored objects may be modified.
+        """
+
+        def write_file(relpath: str, data: bytes, mode: int | None = None) -> None:
+            path = os.path.join(self.repo.path, relpath)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            if mode is not None:
+                os.chmod(path, mode)
+
+        write_file(".gitattributes", b"testdata export-ignore\nVERSION export-subst\n")
+        write_file("VERSION", b"commit=$Format:%H$\nsubject=$Format:%s$\n")
+        write_file("keep.txt", b"keep\n")
+        write_file("testdata/data.txt", b"test data\n")
+        write_file("src/app.py", b"#!/bin/sh\n", 0o755)
+        os.symlink(os.path.join("src", "app.py"), os.path.join(self.repo.path, "link"))
+
+        porcelain.add(self.repo.path)
+        sha = porcelain.commit(
+            self.repo.path,
+            message=b"Release v1\n\nLonger body.\n",
+            author=b"Joe <joe@example.com>",
+            committer=b"Bob <bob@example.com>",
+        )
+
+        commit = self.repo[sha]
+        head_tree_before = commit.tree
+        version_blob_before = self.repo.object_store[
+            self.repo.object_store[head_tree_before][b"VERSION"][1]
+        ].data[:]
+
+        # Contradict the committed attributes in the worktree (uncommitted):
+        # ignore everything, and disable substitution for VERSION.
+        gitattributes_path = os.path.join(self.repo.path, ".gitattributes")
+        with open(gitattributes_path, "wb") as f:
+            f.write(b"* export-ignore\nVERSION -export-subst\n")
+        with open(gitattributes_path, "rb") as f:
+            worktree_attrs = f.read()
+
+        out = BytesIO()
+        err = BytesIO()
+        porcelain.archive(self.repo.path, b"HEAD", outstream=out, errstream=err)
+        self.assertEqual(b"", err.getvalue())
+
+        out.seek(0)
+        tf = tarfile.TarFile(fileobj=out)
+        self.addCleanup(tf.close)
+        members = {m.name: m for m in tf.getmembers()}
+
+        # Ignore set comes from the committed attributes: testdata/ is
+        # pruned wholesale, everything else is present despite the worktree's
+        # "* export-ignore".
+        self.assertEqual(
+            {".gitattributes", "VERSION", "keep.txt", "link", "src/app.py"},
+            set(members),
+        )
+
+        # Substitution bytes come from the commit being archived.
+        version = tf.extractfile("VERSION").read()
+        self.assertEqual(b"commit=" + sha + b"\nsubject=Release v1\n", version)
+
+        # Permissions and entry types survive the trip.
+        self.assertEqual(0o755, members["src/app.py"].mode)
+        self.assertTrue(members["src/app.py"].isreg())
+        self.assertEqual(0o644, members["keep.txt"].mode)
+        self.assertTrue(members["VERSION"].isreg())
+
+        # The symlink stays a symlink with its original target.
+        self.assertTrue(members["link"].issym())
+        self.assertEqual(os.path.join("src", "app.py"), members["link"].linkname)
+
+        # Nothing was modified: worktree attributes, HEAD tree and the
+        # VERSION blob are all untouched.
+        with open(gitattributes_path, "rb") as f:
+            self.assertEqual(worktree_attrs, f.read())
+        self.assertEqual(head_tree_before, self.repo[sha].tree)
+        self.assertEqual(
+            version_blob_before,
+            self.repo.object_store[
+                self.repo.object_store[head_tree_before][b"VERSION"][1]
+            ].data,
+        )
+
 
 class UpdateServerInfoTests(PorcelainTestCase):
     def test_simple(self) -> None:

@@ -34,7 +34,7 @@ from dulwich.archive import (
 )
 from dulwich.object_store import MemoryObjectStore
 from dulwich.objects import Blob, Tree
-from dulwich.tests.utils import build_commit_graph
+from dulwich.tests.utils import build_commit_graph, make_commit
 
 from . import TestCase
 
@@ -234,6 +234,299 @@ class ArchiveTests(TestCase):
 
         # Submodule should be skipped
         self.assertEqual([], tf.getnames())
+
+
+class ArchiveAttributesTests(TestCase):
+    """Tests for export-ignore / export-subst handling in tar_stream."""
+
+    def _blob(self, store: MemoryObjectStore, data: bytes) -> Blob:
+        blob = Blob.from_string(data)
+        store.add_object(blob)
+        return blob
+
+    def _tree(self, store: MemoryObjectStore, entries) -> Tree:
+        tree = Tree()
+        for name, mode, sha in entries:
+            tree.add(name, mode, sha)
+        store.add_object(tree)
+        return tree
+
+    def _tar(self, stream) -> tarfile.TarFile:
+        tf = tarfile.TarFile(fileobj=BytesIO(b"".join(stream)))
+        self.addCleanup(tf.close)
+        return tf
+
+    def test_export_ignore_file_and_directory(self) -> None:
+        """Ignored files are skipped; ignored directories are pruned wholesale."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"secret.txt export-ignore\ntestdata export-ignore\n")
+        secret = self._blob(store, b"secret")
+        keep = self._blob(store, b"keep")
+        data = self._blob(store, b"test data")
+        sub = self._tree(store, [(b"data.txt", 0o100644, data.id)])
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"keep.txt", 0o100644, keep.id),
+                (b"secret.txt", 0o100644, secret.id),
+                (b"testdata", 0o040000, sub.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        self.assertEqual([".gitattributes", "keep.txt"], tf.getnames())
+
+    def test_export_ignore_nested_override_and_unspecified(self) -> None:
+        """Deeper .gitattributes files override (-attr) and reset (!attr)."""
+        store = MemoryObjectStore()
+        root_attrs = self._blob(store, b"*.log export-ignore\n")
+        sub_attrs = self._blob(
+            store, b"keep.log -export-ignore\nunset.log !export-ignore\n"
+        )
+        content = self._blob(store, b"x")
+        sub = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, sub_attrs.id),
+                (b"keep.log", 0o100644, content.id),
+                (b"other.log", 0o100644, content.id),
+                (b"unset.log", 0o100644, content.id),
+            ],
+        )
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, root_attrs.id),
+                (b"sub", 0o040000, sub.id),
+                (b"top.log", 0o100644, content.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        self.assertEqual(
+            [
+                ".gitattributes",
+                "sub/.gitattributes",
+                "sub/keep.log",
+                "sub/unset.log",
+            ],
+            tf.getnames(),
+        )
+
+    def test_export_ignore_unset_does_not_ignore(self) -> None:
+        """-export-ignore explicitly keeps a file that would else be ignored."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"*.txt export-ignore\nkeep.txt -export-ignore\n")
+        content = self._blob(store, b"x")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"drop.txt", 0o100644, content.id),
+                (b"keep.txt", 0o100644, content.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        self.assertEqual([".gitattributes", "keep.txt"], tf.getnames())
+
+    def test_export_subst(self) -> None:
+        """Supported $Format:...$ placeholders expand; unknown ones are kept."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"VERSION export-subst\n")
+        version = self._blob(
+            store,
+            b"full=$Format:%H$\n"
+            b"short=$Format:%h$\n"
+            b"iso=$Format:%aI$\n"
+            b"ts=$Format:%at$\n"
+            b"date=$Format:%ad$\n"
+            b"subject=$Format:%s$\n"
+            b"unknown=$Format:%NoSuchDirective$\n",
+        )
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"VERSION", 0o100644, version.id),
+            ],
+        )
+        commit = make_commit(
+            tree=root.id,
+            author_time=1262304000,
+            author_timezone=0,
+            message=b"Release v1\n\nLonger body.\n",
+        )
+        store.add_object(commit)
+        tf = self._tar(tar_stream(store, root, mtime=0, commit=commit))
+        data = tf.extractfile("VERSION").read()
+        self.assertEqual(
+            b"full=" + commit.id + b"\n"
+            b"short=" + commit.id[:7] + b"\n"
+            b"iso=2010-01-01T00:00:00+00:00\n"
+            b"ts=1262304000\n"
+            b"date=Fri Jan 1 00:00:00 2010 +0000\n"
+            b"subject=Release v1\n"
+            b"unknown=$Format:%NoSuchDirective$\n",
+            data,
+        )
+
+    def test_export_subst_author_timezone(self) -> None:
+        """Author dates are rendered in the commit's author timezone."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"VERSION export-subst\n")
+        version = self._blob(store, b"$Format:%aI$ $Format:%ad$\n")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"VERSION", 0o100644, version.id),
+            ],
+        )
+        commit = make_commit(
+            tree=root.id,
+            author_time=1262304000,
+            author_timezone=8 * 3600,
+            message=b"subject\n",
+        )
+        store.add_object(commit)
+        tf = self._tar(tar_stream(store, root, mtime=0, commit=commit))
+        data = tf.extractfile("VERSION").read()
+        self.assertEqual(
+            b"2010-01-01T08:00:00+08:00 Fri Jan 1 08:00:00 2010 +0800\n",
+            data,
+        )
+
+    def test_export_subst_without_commit_context(self) -> None:
+        """With only a tree (no commit), placeholders are left as-is."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"VERSION export-subst\n")
+        version = self._blob(store, b"commit=$Format:%H$\n")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"VERSION", 0o100644, version.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        self.assertEqual(b"commit=$Format:%H$\n", tf.extractfile("VERSION").read())
+
+    def test_export_subst_only_where_attribute_set(self) -> None:
+        """Files without export-subst keep their placeholders."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"VERSION export-subst\n")
+        version = self._blob(store, b"$Format:%H$\n")
+        other = self._blob(store, b"$Format:%H$\n")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"VERSION", 0o100644, version.id),
+                (b"other.txt", 0o100644, other.id),
+            ],
+        )
+        commit = make_commit(tree=root.id)
+        store.add_object(commit)
+        tf = self._tar(tar_stream(store, root, mtime=0, commit=commit))
+        self.assertEqual(commit.id + b"\n", tf.extractfile("VERSION").read())
+        self.assertEqual(b"$Format:%H$\n", tf.extractfile("other.txt").read())
+
+    def test_symlink_entry_not_substituted_not_dereferenced(self) -> None:
+        """Symlinks keep their tar type; targets are never substituted."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"* export-subst\n")
+        target = self._blob(store, b"placeholder $Format:%H$\n")
+        link = self._blob(store, b"$Format:%H$.txt")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"link", 0o120000, link.id),
+                (b"target.txt", 0o100644, target.id),
+            ],
+        )
+        commit = make_commit(tree=root.id)
+        store.add_object(commit)
+        tf = self._tar(tar_stream(store, root, mtime=0, commit=commit))
+        members = {m.name: m for m in tf.getmembers()}
+        link_member = members["link"]
+        self.assertTrue(link_member.issym())
+        # The link target is the raw blob content: no substitution, and the
+        # link is not dereferenced to target.txt.
+        self.assertEqual("$Format:%H$.txt", link_member.linkname)
+        self.assertEqual(0o777, link_member.mode)
+        self.assertEqual(0, link_member.size)
+        # The regular file the link points at was substituted, though.
+        self.assertEqual(
+            b"placeholder " + commit.id + b"\n",
+            tf.extractfile("target.txt").read(),
+        )
+
+    def test_file_types_and_modes(self) -> None:
+        """Regular files, executables and symlinks keep their tar types."""
+        store = MemoryObjectStore()
+        content = self._blob(store, b"x")
+        link = self._blob(store, b"plain.txt")
+        root = self._tree(
+            store,
+            [
+                (b"exec", 0o100755, content.id),
+                (b"link", 0o120000, link.id),
+                (b"plain.txt", 0o100644, content.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        members = {m.name: m for m in tf.getmembers()}
+        self.assertTrue(members["plain.txt"].isreg())
+        self.assertEqual(0o644, members["plain.txt"].mode)
+        self.assertTrue(members["exec"].isreg())
+        self.assertEqual(0o755, members["exec"].mode)
+        self.assertTrue(members["link"].issym())
+        self.assertEqual("plain.txt", members["link"].linkname)
+
+    def test_prefix_does_not_affect_attribute_matching(self) -> None:
+        """The archive prefix is not part of the repo path used for matching."""
+        store = MemoryObjectStore()
+        attrs = self._blob(store, b"secret.txt export-ignore\n")
+        content = self._blob(store, b"x")
+        root = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, attrs.id),
+                (b"keep.txt", 0o100644, content.id),
+                (b"secret.txt", 0o100644, content.id),
+            ],
+        )
+        # A prefix that itself matches an ignore pattern must not cause
+        # anything to be ignored; matching uses repo-relative paths only.
+        tf = self._tar(tar_stream(store, root, mtime=0, prefix=b"secret.txt"))
+        self.assertEqual(
+            ["secret.txt/.gitattributes", "secret.txt/keep.txt"], tf.getnames()
+        )
+        # And an ignored file stays ignored regardless of the prefix.
+        tf = self._tar(tar_stream(store, root, mtime=0, prefix=b"pkg"))
+        self.assertEqual(["pkg/.gitattributes", "pkg/keep.txt"], tf.getnames())
+
+    def test_subdirectory_gitattributes_scoped_to_subtree(self) -> None:
+        """Patterns in a subdirectory .gitattributes don't leak outside it."""
+        store = MemoryObjectStore()
+        sub_attrs = self._blob(store, b"*.txt export-ignore\n")
+        content = self._blob(store, b"x")
+        sub = self._tree(
+            store,
+            [
+                (b".gitattributes", 0o100644, sub_attrs.id),
+                (b"drop.txt", 0o100644, content.id),
+            ],
+        )
+        root = self._tree(
+            store,
+            [
+                (b"keep.txt", 0o100644, content.id),
+                (b"sub", 0o040000, sub.id),
+            ],
+        )
+        tf = self._tar(tar_stream(store, root, mtime=0))
+        self.assertEqual(["keep.txt", "sub/.gitattributes"], tf.getnames())
 
 
 class ChunkedBytesIOTests(TestCase):

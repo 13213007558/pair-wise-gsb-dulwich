@@ -1204,7 +1204,7 @@ def archive(
         c = parse_commit(repo_obj, committish)
         tree = repo_obj.object_store[c.tree]
         assert isinstance(tree, Tree)
-        for chunk in tar_stream(repo_obj.object_store, tree, c.commit_time):
+        for chunk in tar_stream(repo_obj.object_store, tree, c.commit_time, commit=c):
             outstream.write(chunk)
 
 
