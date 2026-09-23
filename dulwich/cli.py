@@ -1169,7 +1169,10 @@ class cmd_annotate(Command):
                 results = porcelain.annotate(repo, args.path, args.committish)
                 for (commit, entry), line in results:
                     # Show shortened commit hash and line content
-                    commit_hash = commit.id[:8]
+                    if commit is None:
+                        commit_hash = b"?" * 8
+                    else:
+                        commit_hash = commit.id[:8]
                     outstream.write(f"{commit_hash.decode()} {line.decode()}\n")
 
 

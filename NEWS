@@ -1,5 +1,13 @@
 1.2.16	UNRELEASED
 
+ * Add an explicit ``ignore_revisions`` argument to
+   ``dulwich.annotate.annotate_lines`` and the porcelain
+   ``annotate``/``blame`` functions, so that commits that only
+   reformatted the file can be skipped when blaming. Lines introduced by
+   ignored commits are mapped back to earlier commits where possible and
+   marked as unblamable otherwise. A new ``annotate_lines_detailed``
+   function reports line numbers and unblamable lines.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and

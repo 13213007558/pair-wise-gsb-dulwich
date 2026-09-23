@@ -123,6 +123,29 @@ class PorcelainAnnotateTestCase(TestCase):
         self.assertEqual(1, len(result))
         self.assertEqual(b"modified\n", result[0][1])
 
+    def test_porcelain_annotate_ignore_revisions(self) -> None:
+        """Test porcelain annotate with ignore_revisions."""
+        commit1_id = self._make_commit_with_file(
+            "file.txt", b"line1\nline2\n", "Initial commit"
+        )
+        commit2_id = self._make_commit_with_file(
+            "file.txt", b"line1\nline2\nline3\n", "Add third line", parent=commit1_id
+        )
+
+        result = list(
+            annotate(self.temp_dir, "file.txt", ignore_revisions=[commit2_id])
+        )
+
+        self.assertEqual(3, len(result))
+        (commit, entry), line = result[0]
+        self.assertEqual(commit1_id, commit.id)
+        # line3 was added by the ignored commit and cannot be attributed
+        # to any line in the parent version
+        (commit, entry), line = result[2]
+        self.assertEqual(b"line3\n", line)
+        self.assertIsNone(commit)
+        self.assertIsNone(entry)
+
     def test_blame_alias(self) -> None:
         """Test that blame is an alias for annotate."""
         self.assertIs(blame, annotate)

@@ -8554,12 +8554,15 @@ def annotate(
     repo: RepoPath,
     path: str | bytes,
     committish: str | bytes | Commit | Tag | None = None,
-) -> list[tuple[tuple[Commit, TreeEntry], bytes]]:
+    ignore_revisions: Iterable[ObjectID] | None = None,
+) -> list[tuple[tuple[Commit | None, TreeEntry | None], bytes]]:
     """Annotate the history of a file.
 
     :param repo: Path to the repository
     :param path: Path to annotate
     :param committish: Commit id to find path in
+    :param ignore_revisions: Commit ids whose own changes should not be
+        blamed
     :return: List of ((Commit, TreeChange), line) tuples
     """
     if committish is None:
@@ -8571,7 +8574,9 @@ def annotate(
         # Ensure path is bytes
         if isinstance(path, str):
             path = path.encode()
-        return annotate_lines(r.object_store, commit_id, path)
+        return annotate_lines(
+            r.object_store, commit_id, path, ignore_revisions=ignore_revisions
+        )
 
 
 blame = annotate
