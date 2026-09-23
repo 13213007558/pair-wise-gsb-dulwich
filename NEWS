@@ -1,5 +1,12 @@
 1.2.16	UNRELEASED
 
+ * Add ``dulwich.replace.ReplaceRefsObjectStore``, an explicitly enabled,
+   read-only object store view that applies ``refs/replace`` replacements
+   when reading history. Log, tree reads and annotate see the replacement
+   contents while object identities, packs and refs are left untouched.
+   Replacement chains may span multiple hops; missing targets, type
+   mismatches and cycles are reported with the full chain.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and
