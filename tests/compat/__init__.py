@@ -43,6 +43,7 @@ def test_suite() -> unittest.TestSuite:
         "pack",
         "partial_clone",
         "patch",
+        "pickaxe",
         "porcelain",
         "reftable",
         "repository",

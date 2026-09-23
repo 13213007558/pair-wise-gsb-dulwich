@@ -706,7 +706,9 @@ class RenameDetector:
         # TODO: Optimizations:
         #  - Compare object sizes before counting blocks.
         #  - Skip if delete's S_IFMT differs from all adds.
-        #  - Skip if adds or deletes is empty.
+        # Nothing can be paired up, so don't load any blobs.
+        if not self._adds or not self._deletes:
+            return
         # Match C git's behavior of not attempting to find content renames if
         # the matrix size exceeds the threshold.
         if not self._should_find_content_renames():
