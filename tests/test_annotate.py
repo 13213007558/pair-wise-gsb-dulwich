@@ -26,7 +26,13 @@ import tempfile
 from typing import Any
 from unittest import TestCase
 
-from dulwich.annotate import annotate_lines, update_lines
+from dulwich.annotate import (
+    BinaryFileError,
+    MissingBlobError,
+    annotate_lines,
+    annotate_lines_detailed,
+    update_lines,
+)
 from dulwich.objects import Blob, Commit, Tree
 from dulwich.repo import Repo
 
@@ -210,3 +216,290 @@ class AnnotateLinesTestCase(TestCase):
 
         result = annotate_lines(self.repo.object_store, commit_id, b"nonexistent.txt")
         self.assertEqual([], result)
+
+
+class AnnotateIgnoreRevisionsTestCase(TestCase):
+    """Tests for annotate_lines with ignore_revisions."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp()
+        self.repo = Repo.init(self.temp_dir)
+
+    def tearDown(self) -> None:
+        self.repo.close()
+        shutil.rmtree(self.temp_dir)
+
+    def _make_commit(
+        self,
+        files: dict[bytes, bytes],
+        message: str,
+        parents: tuple[bytes, ...] = (),
+        time: int = 1000000000,
+        add_blobs: bool = True,
+    ) -> bytes:
+        """Helper to create a commit with the given files."""
+        tree = Tree()
+        for path, content in files.items():
+            blob = Blob()
+            blob.data = content
+            if add_blobs:
+                self.repo.object_store.add_object(blob)
+            tree.add(path, 0o100644, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        commit = Commit()
+        commit.tree = tree.id
+        commit.author = commit.committer = b"Test Author <test@example.com>"
+        commit.author_time = commit.commit_time = time
+        commit.author_timezone = commit.commit_timezone = 0
+        commit.message = message.encode("utf-8")
+        commit.parents = list(parents)
+        self.repo.object_store.add_object(commit)
+        return commit.id
+
+    def _build_format_history(self) -> tuple[bytes, bytes, bytes, bytes]:
+        """Build: business change, reformat, business change, rename.
+
+        The reformat commit splits a line and adds a line of its own; the
+        file also contains duplicate lines. Commit times are deliberately
+        not monotonically increasing.
+        """
+        c1 = self._make_commit(
+            {
+                b"app.txt": b"header = 1\ntotal = compute(a, b)\ndone\ndone\nfooter = 2\n"
+            },
+            "business: add app",
+            time=1000000000,
+        )
+        c2 = self._make_commit(
+            {
+                b"app.txt": b"# formatted\nheader = 1\ntotal = compute(\n"
+                b"    a, b)\ndone\ndone\nfooter = 2\n"
+            },
+            "style: reformat",
+            parents=(c1,),
+            time=1000000000,
+        )
+        c3 = self._make_commit(
+            {
+                b"app.txt": b"# formatted\nheader = 1\ntotal = compute(\n"
+                b"    a, b)\ndone\ndone\nfooter = 3\n"
+            },
+            "business: bump footer",
+            parents=(c2,),
+            time=999999999,
+        )
+        c4 = self._make_commit(
+            {
+                b"app2.txt": b"# formatted\nheader = 1\ntotal = compute(\n"
+                b"    a, b)\ndone\ndone\nfooter = 3\n"
+            },
+            "rename app.txt to app2.txt",
+            parents=(c3,),
+            time=1000000000,
+        )
+        return c1, c2, c3, c4
+
+    def test_without_ignore_attributes_format_commit(self) -> None:
+        """Without ignore_revisions the format commit is blamed."""
+        c1, c2, c3, c4 = self._build_format_history()
+
+        result = annotate_lines_detailed(self.repo.object_store, c4, b"app2.txt")
+
+        self.assertEqual(
+            [
+                (c2, 1, b"# formatted\n"),
+                (c1, 1, b"header = 1\n"),
+                (c2, 3, b"total = compute(\n"),
+                (c2, 4, b"    a, b)\n"),
+                (c1, 3, b"done\n"),
+                (c1, 4, b"done\n"),
+                (c3, 7, b"footer = 3\n"),
+            ],
+            [
+                (
+                    annotated.commit.id if annotated.commit else None,
+                    annotated.source_lineno,
+                    annotated.line,
+                )
+                for annotated in result
+            ],
+        )
+        self.assertEqual(list(range(1, 8)), [a.lineno for a in result])
+        self.assertFalse(any(a.unblamable for a in result))
+
+    def test_ignore_revisions_maps_lines_back(self) -> None:
+        """Ignored format commit lines map back to earlier authors."""
+        c1, c2, c3, c4 = self._build_format_history()
+
+        result = annotate_lines_detailed(
+            self.repo.object_store, c4, b"app2.txt", ignore_revisions={c2}
+        )
+
+        self.assertEqual(
+            [
+                (None, None, b"# formatted\n"),
+                (c1, 1, b"header = 1\n"),
+                (c1, 2, b"total = compute(\n"),
+                (c1, 2, b"    a, b)\n"),
+                (c1, 3, b"done\n"),
+                (c1, 4, b"done\n"),
+                (c3, 7, b"footer = 3\n"),
+            ],
+            [
+                (
+                    annotated.commit.id if annotated.commit else None,
+                    annotated.source_lineno,
+                    annotated.line,
+                )
+                for annotated in result
+            ],
+        )
+        # Line contents and order still reflect the queried commit.
+        self.assertEqual(list(range(1, 8)), [a.lineno for a in result])
+        # Only the line added by the format commit alone is unblamable.
+        self.assertEqual([True] + [False] * 6, [a.unblamable for a in result])
+        self.assertIsNone(result[0].commit)
+        self.assertIsNone(result[0].entry)
+
+    def test_ignore_revisions_accepts_commit_objects(self) -> None:
+        """ignore_revisions accepts Commit objects as well as ids."""
+        _c1, c2, _c3, c4 = self._build_format_history()
+        c2_commit = self.repo.object_store[c2]
+        assert isinstance(c2_commit, Commit)
+
+        by_id = annotate_lines_detailed(
+            self.repo.object_store, c4, b"app2.txt", ignore_revisions={c2}
+        )
+        by_obj = annotate_lines_detailed(
+            self.repo.object_store, c4, b"app2.txt", ignore_revisions={c2_commit}
+        )
+        self.assertEqual(by_id, by_obj)
+
+    def test_annotate_lines_compat_with_ignore(self) -> None:
+        """annotate_lines with ignore_revisions keeps the legacy shape."""
+        c1, c2, c3, c4 = self._build_format_history()
+
+        result = annotate_lines(
+            self.repo.object_store, c4, b"app2.txt", ignore_revisions={c2}
+        )
+
+        self.assertEqual(
+            [None, c1, c1, c1, c1, c1, c3],
+            [
+                commit.id if commit is not None else None
+                for (commit, _entry), _line in result
+            ],
+        )
+        # The line only added by the ignored commit has no source.
+        (commit, entry), line = result[0]
+        self.assertIsNone(commit)
+        self.assertIsNone(entry)
+        self.assertEqual(b"# formatted\n", line)
+
+    def test_annotate_lines_default_unchanged_by_ignore_param(self) -> None:
+        """Default annotate_lines output is unaffected by the new parameter."""
+        _c1, _c2, _c3, c4 = self._build_format_history()
+
+        legacy = annotate_lines(self.repo.object_store, c4, b"app2.txt")
+        detailed = annotate_lines_detailed(self.repo.object_store, c4, b"app2.txt")
+
+        self.assertEqual(
+            [(commit.id, line) for (commit, _entry), line in legacy],
+            [
+                (annotated.commit.id if annotated.commit else None, annotated.line)
+                for annotated in detailed
+            ],
+        )
+
+    def test_ignore_revisions_merge_parent_selection(self) -> None:
+        """Merge commits still participate in parent selection when ignoring."""
+        c1 = self._make_commit(
+            {
+                b"app.txt": b"header = 1\ntotal = compute(a, b)\ndone\ndone\n"
+                b"footer = 2\n",
+                b"other.txt": b"other\n",
+            },
+            "business: add app",
+            time=1000000000,
+        )
+        c2 = self._make_commit(
+            {
+                b"app.txt": b"# formatted\nheader = 1\ntotal = compute(\n"
+                b"    a, b)\ndone\ndone\nfooter = 2\n",
+                b"other.txt": b"other\n",
+            },
+            "style: reformat",
+            parents=(c1,),
+            time=1000000003,
+        )
+        c3 = self._make_commit(
+            {
+                b"app.txt": b"header = 1\ntotal = compute(a, b)\ndone\ndone\n"
+                b"footer = 3\n",
+                b"other.txt": b"other\n",
+            },
+            "business: bump footer",
+            parents=(c1,),
+            time=1000000002,
+        )
+        # Merge takes the formatted file with the business change on top.
+        c4 = self._make_commit(
+            {
+                b"app.txt": b"# formatted\nheader = 1\ntotal = compute(\n"
+                b"    a, b)\ndone\ndone\nfooter = 3\n",
+                b"other.txt": b"other\n",
+            },
+            "merge",
+            parents=(c2, c3),
+            time=1000000001,
+        )
+
+        result = annotate_lines_detailed(
+            self.repo.object_store, c4, b"app.txt", ignore_revisions={c2}
+        )
+
+        self.assertEqual(
+            [
+                (None, b"# formatted\n"),
+                (c1, b"header = 1\n"),
+                (c1, b"total = compute(\n"),
+                (c1, b"    a, b)\n"),
+                (c1, b"done\n"),
+                (c1, b"done\n"),
+                # The business change came from the second parent; with the
+                # fixed first-parent tie-break the merge is credited.
+                (c4, b"footer = 3\n"),
+            ],
+            [
+                (
+                    annotated.commit.id if annotated.commit else None,
+                    annotated.line,
+                )
+                for annotated in result
+            ],
+        )
+        self.assertEqual([True] + [False] * 6, [a.unblamable for a in result])
+
+    def test_binary_blob_reported(self) -> None:
+        """Binary blobs are reported explicitly."""
+        commit_id = self._make_commit({b"bin.dat": b"\x00\x01\x02\x03"}, "binary")
+
+        with self.assertRaises(BinaryFileError):
+            annotate_lines_detailed(self.repo.object_store, commit_id, b"bin.dat")
+        with self.assertRaises(BinaryFileError):
+            annotate_lines(
+                self.repo.object_store,
+                commit_id,
+                b"bin.dat",
+                ignore_revisions={commit_id},
+            )
+
+    def test_missing_blob_reported(self) -> None:
+        """Missing blobs are reported explicitly."""
+        commit_id = self._make_commit(
+            {b"test.txt": b"content\n"}, "missing blob", add_blobs=False
+        )
+
+        with self.assertRaises(MissingBlobError):
+            annotate_lines_detailed(self.repo.object_store, commit_id, b"test.txt")
