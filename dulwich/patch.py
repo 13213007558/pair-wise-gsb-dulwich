@@ -27,10 +27,12 @@ on.
 
 __all__ = [
     "DEFAULT_DIFF_ALGORITHM",
+    "DEFAULT_WORD_TOKEN_PATTERN",
     "FIRST_FEW_BYTES",
     "DiffAlgorithmNotAvailable",
     "MailinfoResult",
     "PatchApplicationFailure",
+    "WordDiffOp",
     "apply_patch_hunks",
     "apply_patches",
     "commit_patch_id",
@@ -45,6 +47,8 @@ __all__ = [
     "shortid",
     "unified_diff",
     "unified_diff_with_algorithm",
+    "word_diff",
+    "word_diff_blobs",
     "write_blob_diff",
     "write_commit_diff",
     "write_commit_patch",
@@ -409,6 +413,198 @@ def is_binary(content: bytes) -> bool:
       content: Bytestring to check for binary content
     """
     return b"\0" in content[:FIRST_FEW_BYTES]
+
+
+DEFAULT_WORD_TOKEN_PATTERN = r"\w+"
+
+
+@dataclass
+class WordDiffOp:
+    """A single word-level diff operation.
+
+    The ranges are byte offsets into the original old and new contents, so
+    the fragment an operation refers to can be recovered by slicing:
+    old[op.old_start:op.old_end] and new[op.new_start:op.new_end].
+    For "delete" operations the new range is empty, for "insert" operations
+    the old range is empty.
+
+    Concatenating the old fragments of all operations yields the original
+    old content, and concatenating the new fragments yields the original
+    new content.
+    """
+
+    tag: str  # "equal", "delete" or "insert"
+    old_start: int
+    old_end: int
+    new_start: int
+    new_end: int
+
+
+def _split_at_line_boundaries(
+    text: str, start: int, end: int
+) -> Generator[tuple[int, int], None, None]:
+    """Split a char range at line boundaries.
+
+    A line boundary is "\n" or "\r\n"; the boundary characters themselves
+    are not part of any returned span.
+    """
+    pos = start
+    while pos < end:
+        nl = text.find("\n", pos, end)
+        if nl == -1:
+            yield (pos, end)
+            return
+        seg_end = nl - 1 if nl > pos and text[nl - 1] == "\r" else nl
+        if pos < seg_end:
+            yield (pos, seg_end)
+        pos = nl + 1
+
+
+def _tokenize_text(text: str, pattern: "re.Pattern[str]") -> list[tuple[int, int]]:
+    """Split text into token spans (char offsets) that partition the text.
+
+    Spans matched by the token pattern are kept as tokens, except that
+    matches crossing a line boundary are cut there, so a single token can
+    never span lines. Everything not matched - whitespace, punctuation and
+    the line boundaries themselves - is kept as gap spans, so the returned
+    spans are contiguous and cover the whole text.
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for match in pattern.finditer(text):
+        if match.end() == match.start():
+            raise ValueError("token pattern must not match the empty string")
+        for start, end in _split_at_line_boundaries(text, match.start(), match.end()):
+            if pos < start:
+                spans.append((pos, start))
+            spans.append((start, end))
+            pos = end
+    if pos < len(text):
+        spans.append((pos, len(text)))
+    return spans
+
+
+def _byte_offsets(
+    text: str, spans: list[tuple[int, int]], encoding: str
+) -> list[int]:
+    """Cumulative byte offsets for contiguous char spans.
+
+    Returns len(spans) + 1 entries; entry k is the byte offset at which
+    span k starts, and the last entry is the total encoded length.
+    """
+    offsets = [0]
+    for start, end in spans:
+        offsets.append(offsets[-1] + len(text[start:end].encode(encoding)))
+    return offsets
+
+
+def word_diff(
+    old: bytes,
+    new: bytes,
+    token_pattern: "str | re.Pattern[str]" = DEFAULT_WORD_TOKEN_PATTERN,
+    encoding: str = "utf-8",
+) -> list[WordDiffOp]:
+    """Compute a word-level diff between two texts.
+
+    The caller decides what counts as a word via token_pattern; text not
+    matched by the pattern (whitespace, punctuation, newlines) is kept as
+    part of the result rather than being dropped. Matches that would cross
+    a line boundary ("\n" or "\r\n") are cut at the boundary, so a single
+    token can never span lines.
+
+    Args:
+      old: Old content, encoded in the given encoding.
+      new: New content, encoded in the given encoding.
+      token_pattern: Regex (string or compiled pattern) matching one token.
+        Must not match the empty string.
+      encoding: Encoding used to decode the contents (UTF-8 by default).
+
+    Returns:
+      List of WordDiffOp with byte ranges into old and new. Concatenating
+      the old fragments of all operations reproduces old byte for byte,
+      and concatenating the new fragments reproduces new byte for byte.
+
+    Raises:
+      ValueError: If the token pattern matches the empty string.
+      UnicodeDecodeError: If either content is not valid in the encoding.
+    """
+    if isinstance(token_pattern, str):
+        pattern = re.compile(token_pattern)
+    else:
+        pattern = token_pattern
+    old_text = old.decode(encoding)
+    new_text = new.decode(encoding)
+    old_spans = _tokenize_text(old_text, pattern)
+    new_spans = _tokenize_text(new_text, pattern)
+    old_tokens = [old_text[start:end] for start, end in old_spans]
+    new_tokens = [new_text[start:end] for start, end in new_spans]
+    old_offsets = _byte_offsets(old_text, old_spans, encoding)
+    new_offsets = _byte_offsets(new_text, new_spans, encoding)
+    matcher = SequenceMatcher(a=old_tokens, b=new_tokens, autojunk=False)
+    ops: list[WordDiffOp] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            ops.append(
+                WordDiffOp(
+                    "equal",
+                    old_offsets[i1],
+                    old_offsets[i2],
+                    new_offsets[j1],
+                    new_offsets[j2],
+                )
+            )
+            continue
+        if tag in ("delete", "replace") and i2 > i1:
+            ops.append(
+                WordDiffOp(
+                    "delete",
+                    old_offsets[i1],
+                    old_offsets[i2],
+                    new_offsets[j1],
+                    new_offsets[j1],
+                )
+            )
+        if tag in ("insert", "replace") and j2 > j1:
+            ops.append(
+                WordDiffOp(
+                    "insert",
+                    old_offsets[i2],
+                    old_offsets[i2],
+                    new_offsets[j1],
+                    new_offsets[j2],
+                )
+            )
+    return ops
+
+
+def word_diff_blobs(
+    old_blob: "Blob | None",
+    new_blob: "Blob | None",
+    token_pattern: "str | re.Pattern[str]" = DEFAULT_WORD_TOKEN_PATTERN,
+) -> list[WordDiffOp] | None:
+    """Compute a word-level diff between two blob contents.
+
+    This is meant to be called with the two blobs of a changed file as
+    reported by a tree diff (e.g. BaseObjectStore.tree_changes); either
+    side may be None for added or deleted files.
+
+    Args:
+      old_blob: Old blob, or None if the file did not exist.
+      new_blob: New blob, or None if the file was deleted.
+      token_pattern: Regex (string or compiled pattern) matching one token.
+
+    Returns:
+      List of WordDiffOp, or None when a word diff is not applicable
+      because either side is binary (per is_binary()) or not valid UTF-8.
+    """
+    old_data = old_blob.data if old_blob is not None else b""
+    new_data = new_blob.data if new_blob is not None else b""
+    if is_binary(old_data) or is_binary(new_data):
+        return None
+    try:
+        return word_diff(old_data, new_data, token_pattern)
+    except UnicodeDecodeError:
+        return None
 
 
 def shortid(hexsha: bytes | None) -> bytes:
