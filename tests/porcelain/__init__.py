@@ -12471,6 +12471,86 @@ class GrepTests(PorcelainTestCase):
 
         self.assertEqual("subdir/file2.txt:pattern match\n", output)
 
+    def test_grep_with_glob_pathspec(self) -> None:
+        """Test grep with :(glob) pathspec magic."""
+        os.makedirs(os.path.join(self.repo_path, "src", "deep"))
+        with open(os.path.join(self.repo_path, "src", "a.py"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "src", "deep", "b.py"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "src", "c.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo)
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(
+            self.repo, "pattern", outstream=outstream, pathspecs=[":(glob)src/**/*.py"]
+        )
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual(
+            "src/a.py:pattern match\nsrc/deep/b.py:pattern match\n", output
+        )
+
+    def test_grep_with_exclude_pathspec(self) -> None:
+        """Test grep with exclude pathspec magic."""
+        os.makedirs(os.path.join(self.repo_path, "src"))
+        with open(os.path.join(self.repo_path, "keep.txt"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "src", "skip.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo)
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(self.repo, "pattern", outstream=outstream, pathspecs=[":!src"])
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual("keep.txt:pattern match\n", output)
+
+    def test_grep_with_literal_pathspec(self) -> None:
+        """Test grep with :(literal) pathspec magic."""
+        with open(os.path.join(self.repo_path, "star*file.txt"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "starXfile.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo)
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(
+            self.repo,
+            "pattern",
+            outstream=outstream,
+            pathspecs=[":(literal)star*file.txt"],
+        )
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual("star*file.txt:pattern match\n", output)
+
+    def test_grep_invalid_pathspec_magic(self) -> None:
+        """Test grep rejects unsupported pathspec magic."""
+        from dulwich.pathspec import PathspecError
+
+        with open(os.path.join(self.repo_path, "test.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo)
+        porcelain.commit(self.repo, message=b"Add file")
+
+        outstream = StringIO()
+        with self.assertRaises(PathspecError):
+            porcelain.grep(
+                self.repo,
+                "pattern",
+                outstream=outstream,
+                pathspecs=[":(attr:text)test.txt"],
+            )
+
     def test_grep_no_matches(self) -> None:
         """Test grep with no matches."""
         with open(os.path.join(self.repo_path, "empty.txt"), "w") as f:
