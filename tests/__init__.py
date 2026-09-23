@@ -243,6 +243,7 @@ def self_test_suite() -> unittest.TestSuite:
         "objects",
         "objectspec",
         "pack",
+        "pathspec",
         "patch",
         "protocol",
         "range_diff",

@@ -64,6 +64,7 @@ from dulwich.objects import (
     TreeEntry,
 )
 from dulwich.patch import PatchApplicationFailure
+from dulwich.pathspec import PathspecError
 from dulwich.porcelain import (
     CheckoutError,  # Hypothetical or real error class
     CountObjectsResult,
@@ -12470,6 +12471,133 @@ class GrepTests(PorcelainTestCase):
         output = outstream.getvalue().replace("\r\n", "\n")
 
         self.assertEqual("subdir/file2.txt:pattern match\n", output)
+
+    def test_grep_with_glob_pathspec(self) -> None:
+        """Test grep with ':(glob)' pathspec magic."""
+        os.makedirs(os.path.join(self.repo_path, "src", "deep"))
+        with open(os.path.join(self.repo_path, "src", "a.py"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "src", "deep", "b.py"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "src", "c.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["src/a.py", "src/deep/b.py", "src/c.txt"])
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(
+            self.repo,
+            "pattern",
+            outstream=outstream,
+            pathspecs=[":(glob)src/**/*.py"],
+        )
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual(
+            "src/a.py:pattern match\nsrc/deep/b.py:pattern match\n", output
+        )
+
+    def test_grep_with_exclude_pathspec(self) -> None:
+        """Test grep with exclude pathspec magic."""
+        os.makedirs(os.path.join(self.repo_path, "subdir"))
+        with open(os.path.join(self.repo_path, "file1.txt"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "subdir", "file2.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["file1.txt", "subdir/file2.txt"])
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(
+            self.repo, "pattern", outstream=outstream, pathspecs=[":!subdir"]
+        )
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual("file1.txt:pattern match\n", output)
+
+    def test_grep_pathspec_no_partial_component_match(self) -> None:
+        """A pathspec must not match a longer directory name by prefix."""
+        os.makedirs(os.path.join(self.repo_path, "sub"))
+        with open(os.path.join(self.repo_path, "subfile.txt"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "sub", "file.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["subfile.txt", "sub/file.txt"])
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(self.repo, "pattern", outstream=outstream, pathspecs=["sub"])
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual("sub/file.txt:pattern match\n", output)
+
+    def test_grep_pathspec_relative_to_cwd(self) -> None:
+        """Relative pathspecs are resolved against the given cwd."""
+        os.makedirs(os.path.join(self.repo_path, "subdir"))
+        with open(os.path.join(self.repo_path, "file1.txt"), "w") as f:
+            f.write("pattern match\n")
+        with open(os.path.join(self.repo_path, "subdir", "file2.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["file1.txt", "subdir/file2.txt"])
+        porcelain.commit(self.repo, message=b"Add files")
+
+        outstream = StringIO()
+        porcelain.grep(
+            self.repo,
+            "pattern",
+            outstream=outstream,
+            pathspecs=["*.txt"],
+            cwd="subdir",
+        )
+        output = outstream.getvalue().replace("\r\n", "\n")
+
+        self.assertEqual("subdir/file2.txt:pattern match\n", output)
+
+    def test_grep_pathspec_cwd_outside_repository(self) -> None:
+        """A cwd outside the repository is rejected before enumerating."""
+        with open(os.path.join(self.repo_path, "file1.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["file1.txt"])
+        porcelain.commit(self.repo, message=b"Add file")
+
+        outstream = StringIO()
+        with self.assertRaises(PathspecError):
+            porcelain.grep(
+                self.repo,
+                "pattern",
+                outstream=outstream,
+                pathspecs=["*.txt"],
+                cwd="../outside",
+            )
+
+    def test_grep_pathspec_invalid_magic(self) -> None:
+        """Unsupported or conflicting magic raises before enumerating."""
+        with open(os.path.join(self.repo_path, "file1.txt"), "w") as f:
+            f.write("pattern match\n")
+
+        porcelain.add(self.repo, paths=["file1.txt"])
+        porcelain.commit(self.repo, message=b"Add file")
+
+        outstream = StringIO()
+        with self.assertRaises(PathspecError):
+            porcelain.grep(
+                self.repo,
+                "pattern",
+                outstream=outstream,
+                pathspecs=[":(attr:text)file1.txt"],
+            )
+        with self.assertRaises(PathspecError):
+            porcelain.grep(
+                self.repo,
+                "pattern",
+                outstream=outstream,
+                pathspecs=[":(literal,glob)file1.txt"],
+            )
 
     def test_grep_no_matches(self) -> None:
         """Test grep with no matches."""

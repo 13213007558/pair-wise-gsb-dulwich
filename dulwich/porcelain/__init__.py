@@ -4258,6 +4258,7 @@ def grep(
     outstream: TextIO = sys.stdout,
     rev: str | bytes | None = None,
     pathspecs: Sequence[str | bytes] | None = None,
+    cwd: str | bytes | None = None,
     ignore_case: bool = False,
     line_number: bool = False,
     max_depth: int | None = None,
@@ -4270,13 +4271,23 @@ def grep(
       pattern: Regular expression pattern to search for
       outstream: Stream to write results to
       rev: Revision to search in (defaults to HEAD)
-      pathspecs: Optional list of path patterns to limit search
+      pathspecs: Optional list of pathspecs to limit the search.  Git
+        pathspec magic is supported: ':(glob)', ':(literal)', ':(icase)',
+        ':(top)' and ':(exclude)' (plus the ':/', '::', ':!' and ':^'
+        short forms).  See dulwich.pathspec for details.
+      cwd: Directory within the repository that relative pathspecs are
+        resolved against (defaults to the repository root).  A cwd outside
+        the repository is rejected.
       ignore_case: Whether to perform case-insensitive matching
       line_number: Whether to output line numbers
       max_depth: Maximum directory depth to search
       respect_ignores: Whether to respect .gitignore patterns
+    Raises:
+      PathspecError: If a pathspec uses unknown, unsupported or
+        conflicting magic, or escapes the repository.
     """
     from ..object_store import iter_tree_contents
+    from ..pathspec import compile_pathspecs
 
     # Compile the pattern
     flags = re.IGNORECASE if ignore_case else 0
@@ -4313,12 +4324,11 @@ def grep(
                 r, config=r.get_config_stack()
             )
 
-        # Convert pathspecs to bytes
-        pathspecs_bytes: list[bytes] | None = None
+        # Compile pathspecs up front so invalid magic fails before any
+        # tree enumeration happens.
+        pathspec_matcher = None
         if pathspecs:
-            pathspecs_bytes = [
-                p if isinstance(p, bytes) else p.encode("utf-8") for p in pathspecs
-            ]
+            pathspec_matcher = compile_pathspecs(pathspecs, cwd=cwd, root=r.path)
 
         # Iterate through all files in the tree
         for entry in iter_tree_contents(r.object_store, tree.id):
@@ -4338,18 +4348,8 @@ def grep(
                     continue
 
             # Check pathspecs
-            if pathspecs_bytes:
-                matches_pathspec = False
-                for pathspec in pathspecs_bytes:
-                    # Simple prefix matching (could be enhanced with full pathspec support)
-                    if path.startswith(pathspec) or fnmatch.fnmatch(
-                        path.decode("utf-8", errors="replace"),
-                        pathspec.decode("utf-8", errors="replace"),
-                    ):
-                        matches_pathspec = True
-                        break
-                if not matches_pathspec:
-                    continue
+            if pathspec_matcher is not None and not pathspec_matcher.match(path):
+                continue
 
             # Check ignore patterns
             if ignore_manager:
