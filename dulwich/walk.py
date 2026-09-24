@@ -47,6 +47,7 @@ from .diff_tree import (
 )
 from .errors import MissingCommitError
 from .objects import Commit, ObjectID, Tag, Tree
+from .pickaxe import PickaxeFilter, PickaxeMatch
 
 ORDER_DATE = "date"
 ORDER_TOPO = "topo"
@@ -74,6 +75,7 @@ class WalkEntry:
             bytes | None, list[TreeChange] | list[list[TreeChange | None]]
         ] = {}
         self._rename_detector = walker.rename_detector
+        self.pickaxe_matches: list[PickaxeMatch] | None = None
 
     def changes(
         self, path_prefix: bytes | None = None
@@ -320,6 +322,7 @@ class Walker:
         paths: Sequence[bytes] | None = None,
         rename_detector: RenameDetector | None = None,
         follow: bool = False,
+        pickaxe: PickaxeFilter | None = None,
         since: int | None = None,
         until: int | None = None,
         get_parents: Callable[[Commit], list[ObjectID]] = lambda commit: commit.parents,
@@ -344,6 +347,11 @@ class Walker:
             renames.
           follow: If True, follow path across renames/copies. Forces a
             default rename_detector.
+          pickaxe: Optional pickaxe.PickaxeFilter used to only show
+            entries whose changes match a content filter (e.g. an
+            occurrence count change or a changed-line regex match).
+            Matching entries record the matching parents and changes in
+            their pickaxe_matches attribute.
           since: Timestamp to list commits after.
           until: Timestamp to list commits before.
           get_parents: Method to retrieve the parents of a commit
@@ -369,6 +377,7 @@ class Walker:
         if follow and not rename_detector:
             rename_detector = RenameDetector(store)
         self.rename_detector = rename_detector
+        self.pickaxe = pickaxe
         self.get_parents = get_parents
         self.follow = follow
         self.since = since
@@ -427,6 +436,9 @@ class Walker:
         if commit.id in self.excluded:
             return False
 
+        if self.pickaxe is not None:
+            return self._pickaxe_should_return(entry)
+
         if self.paths is None:
             return True
 
@@ -445,6 +457,60 @@ class Walker:
                 if self._change_matches(single_change):
                     return True
         return None
+
+    def _pickaxe_should_return(self, entry: WalkEntry) -> bool | None:
+        """Determine if a walk entry matches the pickaxe filter.
+
+        Path filtering (including rename following) is applied first when
+        paths were requested. For merge commits, each parent is compared
+        separately and the entry's pickaxe_matches attribute records which
+        parents the entry matched against, along with the matching
+        changes.
+
+        Args:
+          entry: The WalkEntry to consider.
+        Returns: True if the WalkEntry should be returned by this walk, or
+            None otherwise.
+        """
+        commit = entry.commit
+        parents = self.get_parents(commit)
+        per_parent: list[tuple[ObjectID | None, list[TreeChange]]] = []
+        if len(parents) > 1:
+            # For merge commits, compare against each parent separately
+            # (like git log -m) rather than using the conflicted-paths
+            # view of WalkEntry.changes(), so that a hit relative to a
+            # single parent is reported for that parent.
+            for parent_id in parents:
+                parent_commit = self.store[parent_id]
+                assert isinstance(parent_commit, Commit)
+                parent_changes = list(
+                    tree_changes(
+                        self.store,
+                        parent_commit.tree,
+                        commit.tree,
+                        rename_detector=self.rename_detector,
+                    )
+                )
+                per_parent.append((parent_id, parent_changes))
+        else:
+            single_changes = cast("list[TreeChange]", entry.changes())
+            per_parent.append((parents[0] if parents else None, single_changes))
+        matches: list[PickaxeMatch] = []
+        for parent, changes in per_parent:
+            matched_changes: list[TreeChange] = []
+            for change in changes:
+                if self.paths is not None and not self._change_matches(change):
+                    continue
+                assert self.pickaxe is not None
+                if not self.pickaxe.matches(self.store, change):
+                    continue
+                matched_changes.append(change)
+            if matched_changes:
+                matches.append(PickaxeMatch(parent, matched_changes))
+        if not matches:
+            return None
+        entry.pickaxe_matches = matches
+        return True
 
     def _next(self) -> WalkEntry | None:
         max_entries = self.max_entries

@@ -244,6 +244,7 @@ def self_test_suite() -> unittest.TestSuite:
         "objectspec",
         "pack",
         "patch",
+        "pickaxe",
         "protocol",
         "range_diff",
         "rebase",

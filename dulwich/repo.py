@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from .object_format import ObjectFormat
     from .object_store import BaseObjectStore, GraphWalker
     from .pack import UnpackedObject
+    from .pickaxe import PickaxeFilter
     from .rebase import RebaseStateManager
     from .walk import Walker
     from .worktree import WorkTree
@@ -1237,6 +1238,7 @@ class BaseRepo:
         paths: Sequence[bytes] | None = None,
         rename_detector: "RenameDetector | None" = None,
         follow: bool = False,
+        pickaxe: "PickaxeFilter | None" = None,
         since: int | None = None,
         until: int | None = None,
         queue_cls: type | None = None,
@@ -1259,6 +1261,9 @@ class BaseRepo:
             renames.
           follow: If True, follow path across renames/copies. Forces a
             default rename_detector.
+          pickaxe: Optional pickaxe.PickaxeFilter used to only show
+            entries whose changes match a content filter (e.g. an
+            occurrence count change or a changed-line regex match).
           since: Timestamp to list commits after.
           until: Timestamp to list commits before.
           queue_cls: A class to use for a queue of commits, supporting the
@@ -1282,6 +1287,7 @@ class BaseRepo:
             paths=paths,
             rename_detector=rename_detector,
             follow=follow,
+            pickaxe=pickaxe,
             since=since,
             until=until,
             get_parents=lambda commit: self.get_parents(commit.id, commit),
