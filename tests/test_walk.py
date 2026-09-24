@@ -21,6 +21,7 @@
 
 """Tests for commit walking functionality."""
 
+import re
 from itertools import permutations
 from unittest import expectedFailure
 
@@ -28,6 +29,7 @@ from dulwich.diff_tree import CHANGE_MODIFY, CHANGE_RENAME, RenameDetector, Tree
 from dulwich.errors import MissingCommitError
 from dulwich.object_store import MemoryObjectStore
 from dulwich.objects import Blob, Commit
+from dulwich.pickaxe import BINARY_BYTES, Pickaxe
 from dulwich.tests.utils import F, build_commit_graph, make_object, make_tag
 from dulwich.walk import ORDER_TOPO, WalkEntry, Walker, _topo_reorder
 
@@ -647,3 +649,194 @@ class WalkEntryTest(TestCase):
             [[TreeChange(CHANGE_MODIFY, entry_a, entry_a2)]],
             changes,
         )
+
+
+class PickaxeTest(TestCase):
+    def test_invalid_args(self) -> None:
+        self.assertRaises(ValueError, Pickaxe)
+        self.assertRaises(ValueError, Pickaxe, needle=b"a", regex=b"b")
+        self.assertRaises(ValueError, Pickaxe, needle=b"")
+        self.assertRaises(ValueError, Pickaxe, needle=b"a", binary="unknown")
+        self.assertRaises(ValueError, Pickaxe, regex=re.compile("a"))
+
+    def test_repr(self) -> None:
+        self.assertEqual(
+            "Pickaxe.literal(b'a', binary='skip')", repr(Pickaxe.literal(b"a"))
+        )
+        self.assertEqual(
+            "Pickaxe.regex(b'a', binary='bytes')",
+            repr(Pickaxe.regex(b"a", binary=BINARY_BYTES)),
+        )
+
+
+class PickaxeWalkerTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = MemoryObjectStore()
+
+    def make_commits(self, commit_spec, **kwargs):
+        return build_commit_graph(self.store, commit_spec, **kwargs)
+
+    def walk(self, include, **kwargs):
+        return list(Walker(self.store, include, **kwargs))
+
+    def test_literal_occurrence_count(self) -> None:
+        blob_a1 = make_object(Blob, data=b"hello\n")
+        blob_a2 = make_object(Blob, data=b"hello\nhello\n")
+        blob_a3 = make_object(Blob, data=b"hello\nhello\n")
+        blob_b3 = make_object(Blob, data=b"unrelated\n")
+        c1, c2, c3 = self.make_commits(
+            [[1], [2, 1], [3, 2]],
+            trees={
+                1: [(b"a", blob_a1)],
+                2: [(b"a", blob_a2)],
+                3: [(b"a", blob_a3), (b"b", blob_b3)],
+            },
+        )
+        entries = self.walk([c3.id], pickaxe=Pickaxe.literal(b"hello"))
+        # c3 does not change the number of occurrences; c2 and the root
+        # commit c1 do.
+        self.assertEqual([c2.id, c1.id], [e.commit.id for e in entries])
+
+    def test_literal_matches_parent_recorded(self) -> None:
+        blob_a1 = make_object(Blob, data=b"x\n")
+        blob_a2 = make_object(Blob, data=b"needle\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a1)], 2: [(b"a", blob_a2)]},
+        )
+        entries = self.walk([c2.id], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([c2.id], [e.commit.id for e in entries])
+        self.assertEqual([c1.id], entries[0].pickaxe_matches)
+
+    def test_root_commit(self) -> None:
+        blob_a = make_object(Blob, data=b"needle\n")
+        (c1,) = self.make_commits([[1]], trees={1: [(b"a", blob_a)]})
+        entries = self.walk([c1.id], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+        # A root commit matches relative to the empty tree, reported as None.
+        self.assertEqual([None], entries[0].pickaxe_matches)
+
+    def test_empty_commit(self) -> None:
+        blob_a = make_object(Blob, data=b"needle\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a)], 2: [(b"a", blob_a)]},
+        )
+        # c2 changes nothing, so it cannot satisfy the condition.
+        entries = self.walk([c2.id], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+
+    def test_moved_line_literal_vs_regex(self) -> None:
+        blob_a1 = make_object(Blob, data=b"alpha\nbeta\ngamma\n")
+        blob_a2 = make_object(Blob, data=b"beta\ngamma\nalpha\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a1)], 2: [(b"a", blob_a2)]},
+        )
+        # Moving a line does not change the occurrence count.
+        entries = self.walk([c2.id], pickaxe=Pickaxe.literal(b"alpha"))
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+        # But the moved line shows up as removed and added in the diff.
+        entries = self.walk([c2.id], pickaxe=Pickaxe.regex(b"^alpha$"))
+        self.assertEqual([c2.id, c1.id], [e.commit.id for e in entries])
+
+    def test_regex_removed_line(self) -> None:
+        blob_a1 = make_object(Blob, data=b"keep\nremove_me\n")
+        blob_a2 = make_object(Blob, data=b"keep\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a1)], 2: [(b"a", blob_a2)]},
+        )
+        entries = self.walk([c2.id], pickaxe=Pickaxe.regex(b"remove_me"))
+        self.assertEqual([c2.id, c1.id], [e.commit.id for e in entries])
+
+    def test_combined_with_paths(self) -> None:
+        blob_a1 = make_object(Blob, data=b"x\n")
+        blob_b2 = make_object(Blob, data=b"needle\n")
+        blob_a3 = make_object(Blob, data=b"needle\n")
+        c1, c2, c3 = self.make_commits(
+            [[1], [2, 1], [3, 2]],
+            trees={
+                1: [(b"a", blob_a1)],
+                2: [(b"a", blob_a1), (b"b", blob_b2)],
+                3: [(b"a", blob_a3), (b"b", blob_b2)],
+            },
+        )
+        # The needle is introduced in b by c2 and in a by c3; with the path
+        # limited to a, only c3 matches.
+        entries = self.walk([c3.id], paths=[b"a"], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([c3.id], [e.commit.id for e in entries])
+        self.assertEqual([c2.id], entries[0].pickaxe_matches)
+
+    def test_rename_without_content_change(self) -> None:
+        blob_a = make_object(Blob, data=b"needle\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a)], 2: [(b"b", blob_a)]},
+        )
+        detector = RenameDetector(self.store)
+        entries = self.walk(
+            [c2.id], rename_detector=detector, pickaxe=Pickaxe.literal(b"needle")
+        )
+        # The rename in c2 does not change the content, so only the root
+        # commit matches.
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+        entries = self.walk(
+            [c2.id], rename_detector=detector, pickaxe=Pickaxe.regex(b"needle")
+        )
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+
+    def test_merge_matches_one_parent(self) -> None:
+        blob_a1 = make_object(Blob, data=b"base\n")
+        blob_a2 = make_object(Blob, data=b"needle\n")
+        blob_a3 = make_object(Blob, data=b"other\n")
+        blob_a4 = make_object(Blob, data=b"needle\nmore\n")
+        c1, c2, c3, c4 = self.make_commits(
+            [[1], [2, 1], [3, 1], [4, 2, 3]],
+            trees={
+                1: [(b"a", blob_a1)],
+                2: [(b"a", blob_a2)],
+                3: [(b"a", blob_a3)],
+                4: [(b"a", blob_a4)],
+            },
+        )
+        entries = self.walk([c4.id], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([c4.id, c2.id], [e.commit.id for e in entries])
+        # Relative to c2 the merge keeps one occurrence; only relative to
+        # c3 does the count change.
+        self.assertEqual([c3.id], entries[0].pickaxe_matches)
+        self.assertEqual([c1.id], entries[1].pickaxe_matches)
+
+    def test_binary_skipped_by_default(self) -> None:
+        blob_a = make_object(Blob, data=b"\x00binary needle\x00\n")
+        (c1,) = self.make_commits([[1]], trees={1: [(b"a", blob_a)]})
+        entries = self.walk([c1.id], pickaxe=Pickaxe.literal(b"needle"))
+        self.assertEqual([], entries)
+        entries = self.walk([c1.id], pickaxe=Pickaxe.regex(b"needle"))
+        self.assertEqual([], entries)
+
+    def test_binary_matched_as_bytes(self) -> None:
+        blob_a = make_object(Blob, data=b"\x00binary needle\x00\n")
+        (c1,) = self.make_commits([[1]], trees={1: [(b"a", blob_a)]})
+        entries = self.walk(
+            [c1.id], pickaxe=Pickaxe.literal(b"needle", binary=BINARY_BYTES)
+        )
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+        entries = self.walk(
+            [c1.id], pickaxe=Pickaxe.regex(b"needle", binary=BINARY_BYTES)
+        )
+        self.assertEqual([c1.id], [e.commit.id for e in entries])
+
+    def test_lazy_iteration(self) -> None:
+        blob_a1 = make_object(Blob, data=b"needle\n")
+        blob_a2 = make_object(Blob, data=b"needle\nneedle\n")
+        c1, c2 = self.make_commits(
+            [[1], [2, 1]],
+            trees={1: [(b"a", blob_a1)], 2: [(b"a", blob_a2)]},
+        )
+        walker = Walker(self.store, [c2.id], pickaxe=Pickaxe.literal(b"needle"))
+        entries = iter(walker)
+        self.assertEqual(c2.id, next(entries).commit.id)
+        self.assertEqual(c1.id, next(entries).commit.id)
+        self.assertRaises(StopIteration, next, entries)

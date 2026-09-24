@@ -47,6 +47,7 @@ from .diff_tree import (
 )
 from .errors import MissingCommitError
 from .objects import Commit, ObjectID, Tag, Tree
+from .pickaxe import Pickaxe
 
 ORDER_DATE = "date"
 ORDER_TOPO = "topo"
@@ -74,6 +75,12 @@ class WalkEntry:
             bytes | None, list[TreeChange] | list[list[TreeChange | None]]
         ] = {}
         self._rename_detector = walker.rename_detector
+        #: When the walker was created with a pickaxe condition and this
+        #: entry matched it, the commit IDs of the parents relative to
+        #: which the condition matched. None as an element indicates the
+        #: condition matched relative to the empty tree (a root commit).
+        #: None overall when no pickaxe condition is in effect.
+        self.pickaxe_matches: list[ObjectID | None] | None = None
 
     def changes(
         self, path_prefix: bytes | None = None
@@ -320,6 +327,7 @@ class Walker:
         paths: Sequence[bytes] | None = None,
         rename_detector: RenameDetector | None = None,
         follow: bool = False,
+        pickaxe: Pickaxe | None = None,
         since: int | None = None,
         until: int | None = None,
         get_parents: Callable[[Commit], list[ObjectID]] = lambda commit: commit.parents,
@@ -344,6 +352,10 @@ class Walker:
             renames.
           follow: If True, follow path across renames/copies. Forces a
             default rename_detector.
+          pickaxe: Optional pickaxe condition; only commits whose changes
+            satisfy it (combined with paths, if any) are returned. Matching
+            entries have their pickaxe_matches attribute set to the parents
+            the condition matched against.
           since: Timestamp to list commits after.
           until: Timestamp to list commits before.
           get_parents: Method to retrieve the parents of a commit
@@ -369,6 +381,7 @@ class Walker:
         if follow and not rename_detector:
             rename_detector = RenameDetector(store)
         self.rename_detector = rename_detector
+        self.pickaxe = pickaxe
         self.get_parents = get_parents
         self.follow = follow
         self.since = since
@@ -393,7 +406,7 @@ class Walker:
                 return True
         return False
 
-    def _change_matches(self, change: TreeChange | None) -> bool:
+    def _change_matches_paths(self, change: TreeChange | None) -> bool:
         assert self.paths
         if change is None:
             return False
@@ -411,6 +424,18 @@ class Walker:
             return True
         return False
 
+    def _change_matches(self, change: TreeChange | None) -> bool:
+        """Check whether a change matches the requested paths and pickaxe."""
+        if change is None:
+            return False
+        if self.paths is not None and not self._change_matches_paths(change):
+            return False
+        if self.pickaxe is not None and not self.pickaxe.matches_change(
+            self.store, change
+        ):
+            return False
+        return True
+
     def _should_return(self, entry: WalkEntry) -> bool | None:
         """Determine if a walk entry should be returned..
 
@@ -427,24 +452,34 @@ class Walker:
         if commit.id in self.excluded:
             return False
 
-        if self.paths is None:
+        if self.paths is None and self.pickaxe is None:
             return True
 
-        if len(self.get_parents(commit)) > 1:
-            for path_changes in entry.changes():
-                # For merge commits, only include changes with conflicts for
-                # this path. Since a rename conflict may include different
-                # old.paths, we have to check all of them.
-                assert isinstance(path_changes, list)
-                for change in path_changes:
-                    if self._change_matches(change):
-                        return True
+        parents = self.get_parents(commit)
+        matched_parents: list[ObjectID | None] = []
+        if len(parents) > 1:
+            # For merge commits, only include changes with conflicts for
+            # this path. Since a rename conflict may include different
+            # old.paths, we have to check all of them. Changes are grouped
+            # per conflicted path, with one entry per parent, so that we
+            # can tell which parent(s) a match is relative to.
+            for parent_index, parent_id in enumerate(parents):
+                for path_changes in entry.changes():
+                    assert isinstance(path_changes, list)
+                    if self._change_matches(path_changes[parent_index]):
+                        matched_parents.append(parent_id)
+                        break
         else:
             for single_change in entry.changes():
                 assert not isinstance(single_change, list)
                 if self._change_matches(single_change):
-                    return True
-        return None
+                    matched_parents.append(parents[0] if parents else None)
+                    break
+        if not matched_parents:
+            return None
+        if self.pickaxe is not None:
+            entry.pickaxe_matches = matched_parents
+        return True
 
     def _next(self) -> WalkEntry | None:
         max_entries = self.max_entries
