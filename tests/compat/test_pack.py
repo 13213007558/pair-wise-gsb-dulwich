@@ -29,7 +29,7 @@ import tempfile
 from typing import NoReturn
 
 from dulwich.file import GitFile
-from dulwich.object_format import DEFAULT_OBJECT_FORMAT
+from dulwich.object_format import DEFAULT_OBJECT_FORMAT, SHA256
 from dulwich.objects import Blob
 from dulwich.pack import (
     PackData,
@@ -240,11 +240,8 @@ class TestPackIndexCompat(PackTests):
 
     def test_index_format_v3_sha256_future(self) -> None:
         """Test that v3 index format is ready for SHA-256 support."""
-        # This test verifies the v3 implementation structure is ready
-        # for SHA-256, even though SHA-256 itself is not yet implemented
-
         # Create a dummy v3 index to test the format
-        entries = [(b"a" * 20, 100, 1234)]  # SHA-1 for now
+        entries = [(b"a" * 20, 100, 1234)]  # SHA-1
 
         v3_path = os.path.join(self._tempdir, "v3_test.idx")
         with GitFile(v3_path, "wb") as f:
@@ -258,7 +255,14 @@ class TestPackIndexCompat(PackTests):
         self.assertEqual(idx.hash_format, 1)  # SHA-1
         self.assertEqual(idx.hash_size, 20)
 
-        # Verify SHA-256 would raise NotImplementedError
-        with self.assertRaises(NotImplementedError):
-            with GitFile(v3_path + ".sha256", "wb") as f:
-                write_pack_index_v3(f, entries, b"x" * 32, hash_format=2)
+        # SHA-256 entries are written with the matching hash format
+        sha256_entries = [(b"a" * 32, 100, 1234)]
+        with GitFile(v3_path + ".sha256", "wb") as f:
+            write_pack_index_v3(f, sha256_entries, b"x" * 32, hash_format=2)
+
+        idx = load_pack_index(v3_path + ".sha256", SHA256)
+        self.addCleanup(idx.close)
+        self.assertIsInstance(idx, PackIndex3)
+        self.assertEqual(idx.version, 3)
+        self.assertEqual(idx.hash_format, 2)  # SHA-256
+        self.assertEqual(idx.hash_size, 32)

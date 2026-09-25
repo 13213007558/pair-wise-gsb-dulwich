@@ -554,7 +554,9 @@ class DumbRemoteHTTPRepo:
                 # Object not found, skip it
                 continue
 
-            unpacked = UnpackedObject(type_num, sha=sha, decomp_chunks=[content])
+            unpacked = UnpackedObject(
+                type_num, sha=hex_to_sha(sha), decomp_chunks=[content]
+            )
             yield unpacked
 
             # Parse the object to find references to other objects

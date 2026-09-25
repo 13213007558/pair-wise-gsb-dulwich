@@ -183,6 +183,11 @@ PACK_SPOOL_FILE_MAX_SIZE = 16 * 1024 * 1024
 # Default pack index version to use when none is specified
 DEFAULT_PACK_INDEX_VERSION = 2
 
+# Map of object format names to pack index v3 hash algorithm identifiers
+_OBJECT_FORMAT_HASH_FORMAT_IDS = {
+    fmt.name: num for num, fmt in OBJECT_FORMAT_TYPE_NUMS.items()
+}
+
 
 OldUnpackedObject = tuple[bytes | int, list[bytes]] | list[bytes] | bytes
 ResolveExtRefFn = Callable[[RawObjectID | ObjectID], tuple[int, bytes | list[bytes]]]
@@ -2380,6 +2385,7 @@ class PackData:
                 f,
                 entries,
                 checksum,
+                object_format=self.object_format,
             )
         return checksum
 
@@ -2401,7 +2407,12 @@ class PackData:
             progress=progress, resolve_ext_ref=resolve_ext_ref
         )
         with GitFile(filename, "wb") as f:
-            return write_pack_index_v2(f, entries, self.calculate_checksum())
+            return write_pack_index_v2(
+                f,
+                entries,
+                self.calculate_checksum(),
+                object_format=self.object_format,
+            )
 
     def create_index_v3(
         self,
@@ -2424,7 +2435,9 @@ class PackData:
         )
         with GitFile(filename, "wb") as f:
             if hash_format is None:
-                hash_format = 1  # Default to SHA-1
+                hash_format = _OBJECT_FORMAT_HASH_FORMAT_IDS[
+                    self.object_format.name
+                ]
             return write_pack_index_v3(
                 f, entries, self.calculate_checksum(), hash_format=hash_format
             )
@@ -3500,7 +3513,9 @@ def write_pack(
         )
     entries_list = sorted([(k, v[0], v[1]) for (k, v) in entries.items()])
     with GitFile(filename + ".idx", "wb") as f:
-        idx_sha = write_pack_index(f, entries_list, data_sum)
+        idx_sha = write_pack_index(
+            f, entries_list, data_sum, object_format=object_format
+        )
     return data_sum, idx_sha
 
 
@@ -3570,6 +3585,7 @@ def deltify_pack_objects(
     *,
     window_size: int | None = None,
     progress: Callable[..., None] | None = None,
+    object_format: "ObjectFormat | None" = None,
 ) -> Iterator[UnpackedObject]:
     """Generate deltas for pack objects.
 
@@ -3577,6 +3593,8 @@ def deltify_pack_objects(
       objects: An iterable of (object, path) tuples to deltify.
       window_size: Window size; None for default
       progress: Optional progress reporting callback
+      object_format: Object format (hash algorithm) to compute object IDs
+        with. If None, each object's own format is used.
     Returns: Iterator over type_num, object id, delta_base, content
         delta_base is None for full text entries
     """
@@ -3593,6 +3611,7 @@ def deltify_pack_objects(
         sorted_objs,
         window_size=window_size,
         progress=progress,
+        object_format=object_format,
     )
 
 
@@ -3631,6 +3650,7 @@ def deltas_from_sorted_objects(
     objects: Iterator[tuple[ShaFile, bytes | None]],
     window_size: int | None = None,
     progress: Callable[..., None] | None = None,
+    object_format: "ObjectFormat | None" = None,
 ) -> Iterator[UnpackedObject]:
     """Create deltas from sorted objects.
 
@@ -3638,6 +3658,8 @@ def deltas_from_sorted_objects(
       objects: Iterator of sorted objects to deltify
       window_size: Delta window size; None for default
       progress: Optional progress reporting callback
+      object_format: Object format (hash algorithm) to compute object IDs
+        with. If None, each object's own format is used.
 
     Returns:
       Iterator of UnpackedObject entries
@@ -3650,6 +3672,8 @@ def deltas_from_sorted_objects(
     for i, (o, path) in enumerate(objects):
         if progress is not None and i % 1000 == 0:
             progress((f"generating deltas: {i}\r").encode())
+        fmt = object_format if object_format is not None else o.object_format
+        oid = o.sha(fmt).digest()
         raw = o.as_raw_chunks()
         raw_bytes = b"".join(raw)  # Join once for efficiency
         winner = raw
@@ -3671,12 +3695,13 @@ def deltas_from_sorted_objects(
                 winner_len = sum(map(len, winner))
         yield UnpackedObject(
             o.type_num,
-            sha=o.sha().digest(),
+            sha=oid,
             delta_base=winner_base,
             decomp_len=winner_len,
             decomp_chunks=winner,
+            hash_func=fmt.hash_func,
         )
-        possible_bases.appendleft((o.sha().digest(), o.type_num, raw_bytes))
+        possible_bases.appendleft((oid, o.type_num, raw_bytes))
         while len(possible_bases) > window_size:
             possible_bases.pop()
 
@@ -3690,6 +3715,7 @@ def pack_objects_to_data(
     delta_window_size: int | None = None,
     ofs_delta: bool = True,
     progress: Callable[..., None] | None = None,
+    object_format: "ObjectFormat | None" = None,
 ) -> tuple[int, Iterator[UnpackedObject]]:
     """Create pack data from objects.
 
@@ -3699,6 +3725,8 @@ def pack_objects_to_data(
       delta_window_size: Delta window size
       ofs_delta: Whether to use offset deltas
       progress: Optional progress reporting callback
+      object_format: Object format (hash algorithm) to compute object IDs
+        with. If None, each object's own format is used.
     Returns: Tuples with (type_num, hexdigest, delta base, object chunks)
     """
     count = len(objects)
@@ -3714,6 +3742,7 @@ def pack_objects_to_data(
                 iter(objects),  # type: ignore
                 window_size=delta_window_size,
                 progress=progress,
+                object_format=object_format,
             ),
         )
     else:
@@ -3721,9 +3750,9 @@ def pack_objects_to_data(
         def iter_without_path() -> Iterator[UnpackedObject]:
             for o in objects:
                 if isinstance(o, tuple):
-                    yield full_unpacked_object(o[0])
+                    yield full_unpacked_object(o[0], object_format)
                 else:
-                    yield full_unpacked_object(o)
+                    yield full_unpacked_object(o, object_format)
 
         return (count, iter_without_path())
 
@@ -3737,9 +3766,21 @@ def generate_unpacked_objects(
     ofs_delta: bool = True,
     other_haves: set[ObjectID] | None = None,
     progress: Callable[..., None] | None = None,
+    object_format: "ObjectFormat | None" = None,
 ) -> Iterator[UnpackedObject]:
     """Create pack data from objects.
 
+    Args:
+      container: Object container to read objects from
+      object_ids: Sequence of (object_id, hint) tuples
+      delta_window_size: Sliding window size for searching for deltas
+      deltify: Whether to deltify objects
+      reuse_deltas: Whether to reuse existing deltas
+      ofs_delta: Whether OFS deltas can be included
+      other_haves: Set of additional object IDs the receiver has
+      progress: Optional progress reporting callback
+      object_format: Object format (hash algorithm) to compute object IDs
+        with. If None, each object's own format is used.
     Returns: Tuples with (type_num, hexdigest, delta base, object chunks)
     """
     todo = dict(object_ids)
@@ -3757,32 +3798,43 @@ def generate_unpacked_objects(
         objects_to_delta = container.iterobjects_subset(
             todo.keys(), allow_missing=False
         )
-        sorted_objs = sort_objects_for_delta((o, todo[o.id]) for o in objects_to_delta)
+        sorted_objs = sort_objects_for_delta(
+            (o, todo[ObjectID(o.get_id(object_format))])
+            for o in objects_to_delta
+        )
         yield from deltas_from_sorted_objects(
             sorted_objs,
             window_size=delta_window_size,
             progress=progress,
+            object_format=object_format,
         )
     else:
         for oid in todo:
-            yield full_unpacked_object(container[oid])
+            yield full_unpacked_object(container[oid], object_format)
 
 
-def full_unpacked_object(o: ShaFile) -> UnpackedObject:
+def full_unpacked_object(
+    o: ShaFile, object_format: "ObjectFormat | None" = None
+) -> UnpackedObject:
     """Create an UnpackedObject from a ShaFile.
 
     Args:
       o: ShaFile object to convert
+      object_format: Object format (hash algorithm) to compute the object
+        ID with. If None, the object's own format is used.
 
     Returns:
       UnpackedObject with full object data
     """
+    if object_format is None:
+        object_format = o.object_format
     return UnpackedObject(
         o.type_num,
         delta_base=None,
         crc32=None,
         decomp_chunks=o.as_raw_chunks(),
-        sha=o.sha().digest(),
+        sha=o.sha(object_format).digest(),
+        hash_func=object_format.hash_func,
     )
 
 
@@ -3823,6 +3875,7 @@ def write_pack_from_container(
         deltify=deltify,
         reuse_deltas=reuse_deltas,
         other_haves=other_haves,
+        object_format=object_format,
     )
 
     return write_pack_data(
@@ -3855,7 +3908,9 @@ def write_pack_objects(
       compression_level: the zlib compression level to use
     Returns: Dict mapping id -> (offset, crc32 checksum), pack checksum
     """
-    pack_contents_count, pack_contents = pack_objects_to_data(objects, deltify=deltify)
+    pack_contents_count, pack_contents = pack_objects_to_data(
+        objects, deltify=deltify, object_format=object_format
+    )
 
     return write_pack_data(
         write,
@@ -3975,7 +4030,14 @@ class PackChunkGenerator:
                 self.cs.update(chunk)
                 object_size += len(chunk)
             actual_num_records += 1
-            self.entries[unpacked.sha()] = (offset, crc32)
+            oid = unpacked.sha()
+            if len(oid) != self.object_format.oid_length:
+                raise ValueError(
+                    f"Object ID length {len(oid)} does not match object "
+                    f"format {self.object_format.name} "
+                    f"(expected {self.object_format.oid_length})"
+                )
+            self.entries[oid] = (offset, crc32)
             offset += object_size
         if actual_num_records != num_records:
             raise AssertionError(
@@ -4026,6 +4088,7 @@ def write_pack_index_v1(
     f: IO[bytes],
     entries: Iterable[tuple[bytes, int, int | None]],
     pack_checksum: bytes,
+    object_format: "ObjectFormat" = SHA1,
 ) -> bytes:
     """Write a new pack index file.
 
@@ -4034,8 +4097,21 @@ def write_pack_index_v1(
       entries: List of tuples with object name (sha), offset_in_pack,
         and crc32_checksum.
       pack_checksum: Checksum of the pack file.
+      object_format: Object format (hash algorithm) in use. Version 1
+        indexes only support SHA-1.
     Returns: The SHA of the written index file
+    Raises:
+      ValueError: If a non-SHA-1 object format is requested or the pack
+        checksum has the wrong length.
     """
+    if object_format is not SHA1:
+        raise ValueError(
+            f"pack index v1 only supports SHA-1, not {object_format.name}"
+        )
+    if len(pack_checksum) != 20:
+        raise ValueError(
+            f"Pack checksum has wrong length: expected 20, got {len(pack_checksum)}"
+        )
     f = SHA1Writer(f)
     fan_out_table: dict[int, int] = defaultdict(lambda: 0)
     for name, _offset, _entry_checksum in entries:
@@ -4050,7 +4126,6 @@ def write_pack_index_v1(
         if not (offset <= 0xFFFFFFFF):
             raise TypeError("pack format 1 only supports offsets < 2Gb")
         f.write(struct.pack(">L20s", offset, name))
-    assert len(pack_checksum) == 20
     f.write(pack_checksum)
     return f.write_sha()
 
@@ -4233,6 +4308,7 @@ def write_pack_index_v2(
     f: IO[bytes],
     entries: Iterable[tuple[bytes, int, int | None]],
     pack_checksum: bytes,
+    object_format: "ObjectFormat | None" = None,
 ) -> bytes:
     """Write a new pack index file.
 
@@ -4241,15 +4317,31 @@ def write_pack_index_v2(
       entries: List of tuples with object name (sha), offset_in_pack, and
         crc32_checksum.
       pack_checksum: Checksum of the pack file.
+      object_format: Object format (hash algorithm) in use. If None, the
+        hash algorithm is inferred from the pack checksum length.
     Returns: The checksum of the index file written
+    Raises:
+      ValueError: If the pack checksum length does not match the object
+        format.
     """
-    # Determine hash algorithm from pack_checksum length
-    if len(pack_checksum) == 20:
-        hash_func = sha1
-    elif len(pack_checksum) == 32:
-        hash_func = sha256
+    if object_format is not None:
+        if len(pack_checksum) != object_format.oid_length:
+            raise ValueError(
+                f"Pack checksum length {len(pack_checksum)} does not match "
+                f"object format {object_format.name} "
+                f"(expected {object_format.oid_length})"
+            )
+        hash_func = object_format.hash_func
     else:
-        raise ValueError(f"Unsupported pack checksum length: {len(pack_checksum)}")
+        # Determine hash algorithm from pack_checksum length
+        if len(pack_checksum) == 20:
+            hash_func = sha1
+        elif len(pack_checksum) == 32:
+            hash_func = sha256
+        else:
+            raise ValueError(
+                f"Unsupported pack checksum length: {len(pack_checksum)}"
+            )
 
     f_writer = HashWriter(f, hash_func)
     f_writer.write(b"\377tOc")  # Magic!
@@ -4310,13 +4402,18 @@ def write_pack_index_v3(
     """
     if hash_format == 1:
         hash_size = 20  # SHA-1
-        writer_cls = SHA1Writer
+        hash_func = sha1
     elif hash_format == 2:
         hash_size = 32  # SHA-256
-        # TODO: Add SHA256Writer when SHA-256 support is implemented
-        raise NotImplementedError("SHA-256 support not yet implemented")
+        hash_func = sha256
     else:
         raise ValueError(f"Unknown hash algorithm {hash_format}")
+
+    if len(pack_checksum) != hash_size:
+        raise ValueError(
+            f"Pack checksum has wrong length: "
+            f"expected {hash_size}, got {len(pack_checksum)}"
+        )
 
     # Convert entries to list to allow multiple iterations
     entries_list = list(entries)
@@ -4325,7 +4422,7 @@ def write_pack_index_v3(
     # For now, use full hash size (this could be optimized)
     shortened_oid_len = hash_size
 
-    f = writer_cls(f)
+    f = HashWriter(f, hash_func)
     f.write(b"\377tOc")  # Magic!
     f.write(struct.pack(">L", 3))  # Version 3
     f.write(struct.pack(">L", hash_format))  # Hash algorithm
@@ -4365,11 +4462,8 @@ def write_pack_index_v3(
     for offset in largetable:
         f.write(struct.pack(b">Q", offset))
 
-    assert len(pack_checksum) == hash_size, (
-        f"Pack checksum has wrong length: expected {hash_size}, got {len(pack_checksum)}"
-    )
     f.write(pack_checksum)
-    return f.write_sha()
+    return f.write_hash()
 
 
 def write_pack_index(
@@ -4378,6 +4472,7 @@ def write_pack_index(
     pack_checksum: bytes,
     progress: Callable[..., None] | None = None,
     version: int | None = None,
+    object_format: "ObjectFormat | None" = None,
 ) -> bytes:
     """Write a pack index file.
 
@@ -4387,22 +4482,46 @@ def write_pack_index(
       pack_checksum: Checksum of the pack file.
       progress: Progress function (not currently used)
       version: Pack index version to use (1, 2, or 3). If None, defaults to DEFAULT_PACK_INDEX_VERSION.
+      object_format: Object format (hash algorithm) in use. If provided,
+        the pack checksum length is validated against it before anything
+        is written, and version 3 indexes record the matching hash
+        algorithm identifier. If None, the hash algorithm is inferred
+        from the pack checksum length.
 
     Returns:
       SHA of the written index file
 
     Raises:
       ValueError: If an unsupported version is specified
+        or the pack checksum does not match the object format
     """
     if version is None:
         version = DEFAULT_PACK_INDEX_VERSION
 
+    if object_format is not None and len(pack_checksum) != object_format.oid_length:
+        raise ValueError(
+            f"Pack checksum length {len(pack_checksum)} does not match "
+            f"object format {object_format.name} "
+            f"(expected {object_format.oid_length})"
+        )
+
     if version == 1:
-        return write_pack_index_v1(f, entries, pack_checksum)
+        return write_pack_index_v1(
+            f, entries, pack_checksum, object_format=object_format or SHA1
+        )
     elif version == 2:
-        return write_pack_index_v2(f, entries, pack_checksum)
+        return write_pack_index_v2(
+            f, entries, pack_checksum, object_format=object_format
+        )
     elif version == 3:
-        return write_pack_index_v3(f, entries, pack_checksum)
+        if object_format is None:
+            # Infer the hash format identifier from the checksum length
+            hash_format = 1 if len(pack_checksum) == 20 else 2
+        else:
+            hash_format = _OBJECT_FORMAT_HASH_FORMAT_IDS[object_format.name]
+        return write_pack_index_v3(
+            f, entries, pack_checksum, hash_format=hash_format
+        )
     else:
         raise ValueError(f"Unsupported pack index version: {version}")
 

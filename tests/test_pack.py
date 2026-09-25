@@ -36,7 +36,7 @@ from typing import NoReturn
 
 from dulwich.errors import ApplyDeltaError, ChecksumMismatch
 from dulwich.file import GitFile
-from dulwich.object_format import DEFAULT_OBJECT_FORMAT
+from dulwich.object_format import DEFAULT_OBJECT_FORMAT, SHA1, SHA256
 from dulwich.object_store import MemoryObjectStore
 from dulwich.objects import Blob, Commit, Tree, hex_to_sha, sha_to_hex
 from dulwich.pack import (
@@ -1416,14 +1416,26 @@ class TestPackIndexWritingv3(TestCase, BaseTestFilePackIndexWriting):
 
     def test_v3_sha256_length(self) -> None:
         """Test v3 index with SHA-256 hash length."""
-        # For now, test that SHA-256 is not yet implemented
         entries = [(b"a" * 32, 42, zlib.crc32(b"data"))]
         filename = os.path.join(self.tempdir, "test_sha256.idx")
-        # SHA-256 should raise NotImplementedError
-        with self.assertRaises(NotImplementedError) as cm:
+        with GitFile(filename, "wb") as f:
+            write_pack_index_v3(f, entries, b"1" * 32, hash_format=2)
+        idx = load_pack_index(filename, SHA256)
+        self.addCleanup(idx.close)
+        self.assertIsInstance(idx, PackIndex3)
+        self.assertEqual(idx.version, 3)
+        self.assertEqual(idx.hash_format, 2)
+        self.assertEqual(idx.hash_size, 32)
+        self.assertEqual(idx.object_offset(b"a" * 32), 42)
+
+    def test_v3_sha256_checksum_length_mismatch(self) -> None:
+        """Test v3 index rejects a pack checksum of the wrong length."""
+        entries = [(b"a" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(self.tempdir, "test_sha256_bad.idx")
+        with self.assertRaises(ValueError) as cm:
             with GitFile(filename, "wb") as f:
-                write_pack_index_v3(f, entries, b"1" * 32, hash_format=2)
-        self.assertIn("SHA-256", str(cm.exception))
+                write_pack_index_v3(f, entries, b"1" * 20, hash_format=2)
+        self.assertIn("wrong length", str(cm.exception))
 
     def test_v3_invalid_hash_algorithm(self) -> None:
         """Test v3 index with invalid hash algorithm."""
@@ -1506,6 +1518,77 @@ class WritePackIndexTests(TestCase):
             with GitFile(filename, "wb") as f:
                 write_pack_index(f, entries, b"P" * 20, version=99)
         self.assertIn("Unsupported pack index version: 99", str(cm.exception))
+
+    def test_write_pack_index_object_format_sha256(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        entries = [(b"1" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(tempdir, "test_sha256.idx")
+
+        with GitFile(filename, "wb") as f:
+            write_pack_index(f, entries, b"P" * 32, object_format=SHA256)
+
+        idx = load_pack_index(filename, SHA256)
+        self.addCleanup(idx.close)
+        self.assertEqual(32, idx.hash_size)
+        self.assertEqual(42, idx.object_offset(b"1" * 32))
+
+    def test_write_pack_index_object_format_sha256_v3(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        entries = [(b"1" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(tempdir, "test_sha256_v3.idx")
+
+        with GitFile(filename, "wb") as f:
+            write_pack_index(f, entries, b"P" * 32, version=3, object_format=SHA256)
+
+        idx = load_pack_index(filename, SHA256)
+        self.addCleanup(idx.close)
+        self.assertEqual(3, idx.version)
+        self.assertEqual(2, idx.hash_format)
+        self.assertEqual(32, idx.hash_size)
+
+    def test_write_pack_index_object_format_mismatch(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        entries = [(b"1" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(tempdir, "test_mismatch.idx")
+
+        # SHA-1 checksum with SHA-256 object format must fail before
+        # anything is written
+        with self.assertRaises(ValueError) as cm:
+            with GitFile(filename, "wb") as f:
+                write_pack_index(f, entries, b"P" * 20, object_format=SHA256)
+        self.assertIn("does not match", str(cm.exception))
+
+    def test_write_pack_index_v1_rejects_sha256(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        entries = [(b"1" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(tempdir, "test_v1_sha256.idx")
+
+        with self.assertRaises(ValueError) as cm:
+            with GitFile(filename, "wb") as f:
+                write_pack_index(f, entries, b"P" * 32, version=1, object_format=SHA256)
+        self.assertIn("only supports SHA-1", str(cm.exception))
+
+    def test_write_pack_index_sha1_explicit_object_format(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir)
+
+        entries = [(b"1" * 20, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(tempdir, "test_sha1_explicit.idx")
+
+        with GitFile(filename, "wb") as f:
+            write_pack_index(f, entries, b"P" * 20, object_format=SHA1)
+
+        idx = load_pack_index(filename, SHA1)
+        self.addCleanup(idx.close)
+        self.assertEqual(20, idx.hash_size)
 
 
 class MockFileWithoutFileno:
