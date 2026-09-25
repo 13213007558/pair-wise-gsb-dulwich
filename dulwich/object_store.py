@@ -270,6 +270,16 @@ def _remove_readonly(path: str) -> None:
         os.remove(path)
 
 
+def _rmtree(path: str | os.PathLike[str]) -> None:
+    """Remove a directory tree, clearing read-only attributes as needed."""
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        for name in filenames:
+            _remove_readonly(os.path.join(dirpath, name))
+        for name in dirnames:
+            os.rmdir(os.path.join(dirpath, name))
+    os.rmdir(path)
+
+
 class PackInputTooLarge(OSError):
     """Raised when a received pack exceeds the configured input size cap.
 
@@ -2405,6 +2415,101 @@ class DiskObjectStore(PackBasedObjectStore):
             )
             return self._complete_pack(f, path, entries, ext_refs, progress=progress)
 
+    def make_quarantine(self) -> "DiskObjectStore":
+        """Create a temporary quarantine object store for this store.
+
+        Objects received from a push are placed in the quarantine store
+        first, so that a rejected push cannot leak objects into the
+        official object database. The quarantine store reads through to
+        this store (as an alternate), so hooks and thin packs can use
+        pre-existing objects, while readers of this store never see
+        quarantined objects.
+
+        Returns: A new DiskObjectStore. The caller must eventually call
+            either :meth:`migrate_quarantine` to publish its objects into
+            this store or :meth:`discard_quarantine` to delete it.
+        """
+        import tempfile
+
+        path = tempfile.mkdtemp(prefix="incoming-", dir=self.path)
+        try:
+            os.mkdir(os.path.join(path, INFODIR))
+            os.mkdir(os.path.join(path, PACKDIR))
+        except BaseException:
+            _rmtree(path)
+            raise
+        return DiskObjectStore(
+            path,
+            loose_compression_level=self.loose_compression_level,
+            pack_compression_level=self.pack_compression_level,
+            pack_index_version=self.pack_index_version,
+            fsync_object_files=self.fsync_object_files,
+            shared_perm=self.shared_perm,
+            object_format=self.object_format,
+            alternates=[self.path],
+        )
+
+    def migrate_quarantine(self, quarantine: "DiskObjectStore") -> None:
+        """Publish the objects held by a quarantine store into this store.
+
+        Args:
+            quarantine: Quarantine store previously created with
+                :meth:`make_quarantine`. Its objects are moved into this
+                store; the (now mostly empty) quarantine directory itself
+                is left behind for :meth:`discard_quarantine` to remove.
+        """
+        # Release quarantine pack handles first: an open mapping would
+        # block the rename on Windows.
+        quarantine.close()
+        for name in os.listdir(quarantine.pack_dir):
+            src = os.path.join(quarantine.pack_dir, name)
+            target = os.path.join(self.pack_dir, name)
+            if os.path.exists(target):
+                # Pack and index names are derived from their contents, so
+                # an existing file is identical to the one being moved.
+                _remove_readonly(src)
+            else:
+                os.rename(src, target)
+        for entry in os.listdir(quarantine.path):
+            if len(entry) != 2:
+                continue
+            src_dir = os.path.join(quarantine.path, entry)
+            if not os.path.isdir(src_dir):
+                continue
+            try:
+                int(entry, 16)
+            except ValueError:
+                continue
+            target_dir = os.path.join(self.path, entry)
+            try:
+                os.mkdir(target_dir)
+                adjust_shared_perm(target_dir, self.shared_perm)
+            except FileExistsError:
+                pass
+            for name in os.listdir(src_dir):
+                src = os.path.join(src_dir, name)
+                target = os.path.join(target_dir, name)
+                if os.path.exists(target):
+                    # Loose object names are derived from their contents.
+                    _remove_readonly(src)
+                else:
+                    os.rename(src, target)
+        self._update_pack_cache()
+
+    @staticmethod
+    def discard_quarantine(quarantine: "DiskObjectStore") -> None:
+        """Discard a quarantine store and all objects still held by it.
+
+        Args:
+            quarantine: Quarantine store previously created with
+                :meth:`make_quarantine`. Tolerates being called after
+                :meth:`migrate_quarantine` or on an already removed
+                quarantine directory.
+        """
+        quarantine.close()
+        if os.path.isdir(quarantine.path):
+            _rmtree(quarantine.path)
+
     def add_pack(
         self,
     ) -> tuple[BinaryIO, Callable[[], None], Callable[[], None]]:
@@ -3058,6 +3163,8 @@ class MemoryObjectStore(PackCapableObjectStore):
         read_all: Callable[[int], bytes],
         read_some: Callable[[int], bytes] | None,
         progress: Callable[[str], None] | None = None,
+        *,
+        max_input_size: int | None = None,
     ) -> None:
         """Add a new thin pack to this object store.
 
@@ -3071,7 +3178,15 @@ class MemoryObjectStore(PackCapableObjectStore):
           read_some: Read function that returns at least one byte, but may
             not return the number of bytes requested.
           progress: Optional progress reporting function.
+          max_input_size: Maximum number of bytes that may be read from
+            the wire while ingesting this pack. ``None`` (the default) or
+            ``0`` mean unlimited; exceeding the cap raises
+            :class:`PackInputTooLarge`.
         """
+        if max_input_size:
+            read_all, read_some = _bound_read_callables(
+                read_all, read_some, max_input_size
+            )
         f, commit, abort = self.add_pack()
         try:
             copier = PackStreamCopier(

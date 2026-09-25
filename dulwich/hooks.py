@@ -262,13 +262,18 @@ class PreReceiveShellHook(ShellHook):
         ShellHook.__init__(self, "pre-receive", path=filepath, numparam=0)
 
     def execute(
-        self, client_refs: Sequence[tuple[bytes, bytes, bytes]]
+        self,
+        client_refs: Sequence[tuple[bytes, bytes, bytes]],
+        env: "dict[str, str] | None" = None,
     ) -> tuple[bytes, bytes]:
         """Execute the pre-receive hook.
 
         Args:
             client_refs: List of tuples containing (old_sha, new_sha, ref_name)
                         for each reference to be updated
+            env: Optional extra environment variables for the hook
+                        subprocess, e.g. the quarantine object directory
+                        that holds the pushed objects
 
         Returns:
             Tuple of (stdout, stderr) from hook execution
@@ -281,15 +286,17 @@ class PreReceiveShellHook(ShellHook):
             return (b"", b"")
 
         try:
-            env = os.environ.copy()
-            env["GIT_DIR"] = self.controldir
+            hook_env = os.environ.copy()
+            hook_env["GIT_DIR"] = self.controldir
+            if env:
+                hook_env.update(env)
 
             p = subprocess.Popen(
                 self.filepath,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=env,
+                env=hook_env,
             )
 
             # client_refs is a list of (oldsha, newsha, ref)
@@ -320,7 +327,11 @@ class UpdateShellHook(ShellHook):
         ShellHook.__init__(self, "update", path=filepath, numparam=3)
 
     def execute(
-        self, ref_name: bytes, old_sha: bytes, new_sha: bytes
+        self,
+        ref_name: bytes,
+        old_sha: bytes,
+        new_sha: bytes,
+        env: "dict[str, str] | None" = None,
     ) -> tuple[bytes, bytes]:
         """Execute the update hook for a single ref.
 
@@ -328,6 +339,9 @@ class UpdateShellHook(ShellHook):
             ref_name: Name of the reference being updated
             old_sha: Old SHA of the reference
             new_sha: New SHA of the reference
+            env: Optional extra environment variables for the hook
+                    subprocess, e.g. the quarantine object directory
+                    that holds the pushed objects
 
         Returns:
             Tuple of (stdout, stderr) from hook execution
@@ -340,8 +354,10 @@ class UpdateShellHook(ShellHook):
             return (b"", b"")
 
         try:
-            env = os.environ.copy()
-            env["GIT_DIR"] = self.controldir
+            hook_env = os.environ.copy()
+            hook_env["GIT_DIR"] = self.controldir
+            if env:
+                hook_env.update(env)
 
             p = subprocess.Popen(
                 [
@@ -352,7 +368,7 @@ class UpdateShellHook(ShellHook):
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=env,
+                env=hook_env,
             )
 
             out_data, err_data = p.communicate()

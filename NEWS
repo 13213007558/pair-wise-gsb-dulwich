@@ -1,5 +1,13 @@
 1.2.16	UNRELEASED
 
+ * Quarantine objects received by ``receive-pack`` until the push is
+   accepted. Packs are unpacked into a temporary object directory that
+   reads through to the repository, hooks see the pushed objects through
+   ``GIT_QUARANTINE_PATH``/``GIT_OBJECT_DIRECTORY``, and the updated refs
+   are checked for a complete object graph before anything is published.
+   Rejected, disconnected or invalid pushes no longer leave objects in
+   the repository's object store.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and

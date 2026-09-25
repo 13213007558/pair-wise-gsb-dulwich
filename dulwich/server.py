@@ -77,7 +77,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from functools import partial
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, cast
 from typing import Protocol as TypingProtocol
 
 if TYPE_CHECKING:
@@ -97,6 +97,7 @@ from .errors import (
     ObjectFormatException,
     UnexpectedCommandError,
 )
+from .hooks import PreReceiveShellHook, UpdateShellHook
 from .object_filters import (
     CombineFilter,
     FilterSpec,
@@ -106,8 +107,13 @@ from .object_filters import (
     filter_pack_objects_with_paths,
     parse_filter_spec,
 )
-from .object_store import MissingObjectFinder, PackBasedObjectStore, find_shallow
-from .objects import Commit, ObjectID, Tree, valid_hexsha
+from .object_store import (
+    DiskObjectStore,
+    MissingObjectFinder,
+    PackBasedObjectStore,
+    find_shallow,
+)
+from .objects import S_ISGITLINK, Commit, ObjectID, Tag, Tree, valid_hexsha
 from .pack import ObjectContainer, write_pack_from_container
 from .protocol import (
     CAPABILITIES_REF,
@@ -1402,6 +1408,52 @@ class MultiAckDetailedGraphWalkerImpl(AckGraphWalkerImpl):
         return True
 
 
+def _find_missing_reachable_objects(
+    object_store: "BaseObjectStore",
+    tips: Iterable[ObjectID],
+    have_store: "BaseObjectStore | None" = None,
+) -> list[ObjectID]:
+    """Find objects reachable from tips that are missing from a store.
+
+    Objects already present in ``have_store`` are assumed to have a
+    complete object graph of their own and are not descended into.
+
+    Args:
+        object_store: Store to look objects up in.
+        tips: Object ids to start the traversal from.
+        have_store: Optional store of objects that are already known to
+            be complete (e.g. the repository's official object store).
+
+    Returns:
+        List of object ids that could not be found.
+    """
+    missing: list[ObjectID] = []
+    seen: set[ObjectID] = set()
+    pending = list(tips)
+    while pending:
+        sha = pending.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        if have_store is not None and sha in have_store:
+            continue
+        try:
+            obj = object_store[sha]
+        except KeyError:
+            missing.append(sha)
+            continue
+        if isinstance(obj, Commit):
+            pending.append(obj.tree)
+            pending.extend(obj.parents)
+        elif isinstance(obj, Tree):
+            for _name, mode, entry_sha in obj.items():
+                if mode is not None and entry_sha is not None and not S_ISGITLINK(mode):
+                    pending.append(entry_sha)
+        elif isinstance(obj, Tag):
+            pending.append(obj.object[1])
+    return missing
+
+
 class ReceivePackHandler(PackHandler):
     """Protocol handler for downloading a pack from the client."""
 
@@ -1425,6 +1477,8 @@ class ReceivePackHandler(PackHandler):
         super().__init__(backend, proto, stateless_rpc=stateless_rpc)
         self.repo = backend.open_repository(args[0])
         self.advertise_refs = advertise_refs
+        self._quarantine: DiskObjectStore | None = None
+        self._pre_receive_declined = False
 
     def capabilities(self) -> Iterable[bytes]:
         """Return supported capabilities.
@@ -1462,10 +1516,63 @@ class ReceivePackHandler(PackHandler):
             return None
         return value if value > 0 else None
 
+    def _make_quarantine(self) -> DiskObjectStore | None:
+        """Create a quarantine object store for this push, if possible.
+
+        Returns None when the repository object store does not support
+        quarantining (e.g. an in-memory store); in that case received
+        objects are added to the repository object store directly.
+        """
+        object_store = self.repo.object_store
+        if not isinstance(object_store, DiskObjectStore):
+            return None
+        self._quarantine = object_store.make_quarantine()
+        return self._quarantine
+
+    def _discard_quarantine(self, quarantine: DiskObjectStore | None) -> None:
+        """Discard a quarantine store, dropping all objects in it."""
+        if quarantine is None:
+            return
+        DiskObjectStore.discard_quarantine(quarantine)
+        if self._quarantine is quarantine:
+            self._quarantine = None
+
+    def _quarantine_hook_env(self) -> dict[str, str] | None:
+        """Environment that lets hook subprocesses see quarantined objects.
+
+        Hooks read the pushed objects from the quarantine directory and
+        fall back to the repository's object store (and its alternates)
+        for pre-existing objects, mirroring git's GIT_QUARANTINE_PATH
+        behaviour.
+        """
+        if self._quarantine is None:
+            return None
+        object_store = self.repo.object_store
+        if not isinstance(object_store, DiskObjectStore):
+            return None
+        alternates = [object_store.path]
+        for alternate in object_store.alternates:
+            if isinstance(alternate, DiskObjectStore):
+                alternates.append(alternate.path)
+        return {
+            "GIT_QUARANTINE_PATH": os.fspath(self._quarantine.path),
+            "GIT_OBJECT_DIRECTORY": os.fspath(self._quarantine.path),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.pathsep.join(
+                os.fspath(path) for path in alternates
+            ),
+        }
+
     def _apply_pack(
         self, refs: list[tuple[ObjectID, ObjectID, Ref]]
     ) -> Iterator[tuple[bytes, bytes]]:
         """Apply received pack to repository.
+
+        The pack is received into a quarantine object store: hooks can
+        inspect the pushed objects, but they only become visible to other
+        readers once the hooks and the connectivity check have passed and
+        the quarantine has been published. Any failure before that point
+        (hook rejection, disconnect, invalid pack) discards the
+        quarantined objects.
 
         Args:
             refs: List of (old_sha, new_sha, ref_name) tuples
@@ -1483,100 +1590,111 @@ class ReceivePackHandler(PackHandler):
             zlib.error,
             ObjectFormatException,
         )
-        will_send_pack = False
         zero_sha = ObjectID(b"0" * self.repo.object_format.hex_length)
+        will_send_pack = any(command[1] != zero_sha for command in refs)
+        atomic = self.has_capability(CAPABILITY_ATOMIC)
 
-        for command in refs:
-            if command[1] != zero_sha:
-                will_send_pack = True
-
+        quarantine: DiskObjectStore | None = None
         if will_send_pack:
             # TODO: more informative error messages than just the exception
             # string
             try:
+                quarantine = self._make_quarantine()
+                object_store = (
+                    quarantine if quarantine is not None else self.repo.object_store
+                )
                 recv = getattr(self.proto, "recv", None)
-                self.repo.object_store.add_thin_pack(  # type: ignore[attr-defined]
+                object_store.add_thin_pack(  # type: ignore[attr-defined]
                     self.proto.read,
                     recv,
                     max_input_size=self._receive_max_input_size(),
                 )
-                yield (b"unpack", b"ok")
             except all_exceptions as e:
+                self._discard_quarantine(quarantine)
                 yield (b"unpack", str(e).replace("\n", "").encode("utf-8"))
-                # The pack may still have been moved in, but it may contain
-                # broken objects. We trust a later GC to clean it up.
                 return
+            except BaseException:
+                # E.g. a disconnect that does not surface as an IOError:
+                # never leave quarantined objects behind.
+                self._discard_quarantine(quarantine)
+                raise
+            if quarantine is not None:
+                # A pack that inflates cleanly is not enough: the updated
+                # refs must be able to reach a complete object graph.
+                # External (thin pack) bases may come from the repository,
+                # but anything else that is missing fails the push.
+                missing = _find_missing_reachable_objects(
+                    quarantine,
+                    [new_sha for _, new_sha, _ in refs if new_sha != zero_sha],
+                    have_store=self.repo.object_store,
+                )
+                if missing:
+                    self._discard_quarantine(quarantine)
+                    yield (
+                        b"unpack",
+                        b"incomplete object graph, missing object " + missing[0],
+                    )
+                    return
+            yield (b"unpack", b"ok")
         else:
             # The git protocol want to find a status entry related to unpack
             # process even if no pack data has been sent.
             yield (b"unpack", b"ok")
 
-        atomic = self.has_capability(CAPABILITY_ATOMIC)
-
-        if atomic:
-            # Atomic push: validate all refs first, then apply all or none
-            ref_results: list[tuple[Ref, bytes]] = []
-            has_failure = False
-
-            for oldsha, sha, ref in refs:
-                ref_status = b"ok"
-
-                hook_error = self._on_update(ref, oldsha, sha)
-                if hook_error:
-                    ref_status = hook_error
-                    has_failure = True
-                else:
-                    try:
-                        if sha == zero_sha:
-                            if CAPABILITY_DELETE_REFS not in self.capabilities():
-                                raise GitProtocolError(
-                                    "Attempted to delete refs without "
-                                    "delete-refs capability."
-                                )
-                    except KeyError:
-                        ref_status = b"bad ref"
-                        has_failure = True
-
-                ref_results.append((ref, ref_status))
-
-            if has_failure:
-                # At least one ref failed validation; fail all refs
-                for ref, status in ref_results:
-                    if status == b"ok":
-                        yield (ref, b"atomic push failed")
-                    else:
-                        yield (ref, status)
+        try:
+            # The pre-receive hook runs with the pack in the quarantine, so
+            # it can inspect the pushed objects but can still abort the
+            # push before anything is published.
+            try:
+                self._on_pre_receive(refs)
+            except HookError:
+                self._pre_receive_declined = True
+                for _, _, ref_name in refs:
+                    yield (ref_name, b"pre-receive hook declined")
                 return
 
-            # All validations passed; apply all ref updates
-            for oldsha, sha, ref in refs:
-                ref_status = b"ok"
-                try:
-                    if sha == zero_sha:
-                        try:
-                            self.repo.refs.remove_if_equals(ref, oldsha)
-                        except all_exceptions:
-                            ref_status = b"failed to delete"
-                    else:
-                        try:
-                            self.repo.refs.set_if_equals(ref, oldsha, sha)
-                        except all_exceptions:
-                            ref_status = b"failed to write"
-                except KeyError:
-                    ref_status = b"bad ref"
-                yield (ref, ref_status)
-        else:
-            for oldsha, sha, ref in refs:
-                ref_status = b"ok"
+            # Run the update hooks before publishing anything, so that a
+            # declined push leaves the official object store untouched.
+            hook_errors = [
+                self._on_update(ref, oldsha, sha) for oldsha, sha, ref in refs
+            ]
 
-                # Run update hook for this ref
-                hook_error = self._on_update(ref, oldsha, sha)
-                if hook_error:
+            if atomic:
+                # Atomic push: validate all refs first, then apply all or none
+                for (oldsha, sha, ref), hook_error in zip(refs, hook_errors):
+                    if hook_error is None and sha == zero_sha:
+                        if CAPABILITY_DELETE_REFS not in self.capabilities():
+                            raise GitProtocolError(
+                                "Attempted to delete refs without "
+                                "delete-refs capability."
+                            )
+                if any(hook_errors):
+                    # At least one ref failed validation; fail all refs
+                    for (oldsha, sha, ref), hook_error in zip(refs, hook_errors):
+                        if hook_error is None:
+                            yield (ref, b"atomic push failed")
+                        else:
+                            yield (ref, hook_error)
+                    return
+
+            # Publish the quarantined objects before updating any ref, so
+            # that refs never point at objects missing from the object
+            # store.
+            if quarantine is not None and any(
+                hook_error is None and sha != zero_sha
+                for (oldsha, sha, ref), hook_error in zip(refs, hook_errors)
+            ):
+                cast(DiskObjectStore, self.repo.object_store).migrate_quarantine(
+                    quarantine
+                )
+
+            for (oldsha, sha, ref), hook_error in zip(refs, hook_errors):
+                if hook_error is not None:
                     # Update hook declined this ref
-                    ref_status = hook_error
-                    yield (ref, ref_status)
+                    yield (ref, hook_error)
                     continue
 
+                ref_status = b"ok"
                 try:
                     if sha == zero_sha:
                         if CAPABILITY_DELETE_REFS not in self.capabilities():
@@ -1596,6 +1714,8 @@ class ReceivePackHandler(PackHandler):
                 except KeyError:
                     ref_status = b"bad ref"
                 yield (ref, ref_status)
+        finally:
+            self._discard_quarantine(quarantine)
 
     def _report_status(self, status: Sequence[tuple[bytes, bytes]]) -> None:
         """Report status to client.
@@ -1644,7 +1764,11 @@ class ReceivePackHandler(PackHandler):
         if not hook:
             return
         try:
-            stdout, stderr = hook.execute(client_refs)
+            env = self._quarantine_hook_env()
+            if env is not None and isinstance(hook, PreReceiveShellHook):
+                stdout, stderr = hook.execute(client_refs, env=env)
+            else:
+                stdout, stderr = hook.execute(client_refs)
             # Only send output via sideband if capabilities are set
             if self._client_capabilities is not None:
                 if stdout and self.has_capability(CAPABILITY_SIDE_BAND_64K):
@@ -1679,7 +1803,11 @@ class ReceivePackHandler(PackHandler):
         if not hook:
             return None
         try:
-            stdout, stderr = hook.execute(ref_name, old_sha, new_sha)
+            env = self._quarantine_hook_env()
+            if env is not None and isinstance(hook, UpdateShellHook):
+                stdout, stderr = hook.execute(ref_name, old_sha, new_sha, env=env)
+            else:
+                stdout, stderr = hook.execute(ref_name, old_sha, new_sha)
             # Only send output via sideband if capabilities are set
             if self._client_capabilities is not None:
                 if stdout and self.has_capability(CAPABILITY_SIDE_BAND_64K):
@@ -1757,26 +1885,11 @@ class ReceivePackHandler(PackHandler):
             client_refs.append((ObjectID(oldsha), ObjectID(newsha), Ref(ref_name)))
             ref_line = self.proto.read_pkt_line()
 
-        # Run pre-receive hook before processing the pack
-        # If it fails, we abort the entire push
-        try:
-            self._on_pre_receive(client_refs)
-        except HookError:
-            # Hook failed, report error to client and abort
-            # We still need to consume the pack data to avoid protocol errors
-            if self.has_capability(CAPABILITY_REPORT_STATUS):
-                # Send unpack error status
-                status = [(b"unpack", b"pre-receive hook declined")]
-                # Add 'ng' (not good) status for all refs
-                for _, _, ref_name in client_refs:
-                    status.append((ref_name, b"pre-receive hook declined"))
-                self._report_status(status)
-            return
-
         # backend can now deal with this refs and read a pack using self.read
         status = list(self._apply_pack(client_refs))
 
-        self._on_post_receive(client_refs)  # type: ignore[arg-type]
+        if not self._pre_receive_declined:
+            self._on_post_receive(client_refs)  # type: ignore[arg-type]
 
         # when we have read all the pack from the client, send a status report
         # if the client asked for it

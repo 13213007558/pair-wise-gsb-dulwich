@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from io import BytesIO
 from unittest.mock import Mock
 
@@ -37,7 +38,8 @@ from dulwich.errors import (
 )
 from dulwich.object_filters import BlobNoneFilter
 from dulwich.object_store import MemoryObjectStore, find_shallow
-from dulwich.objects import Tree
+from dulwich.objects import Blob, Tree
+from dulwich.pack import REF_DELTA
 from dulwich.protocol import ZERO_SHA, format_capability_line
 from dulwich.repo import MemoryRepo, Repo
 from dulwich.server import (
@@ -55,7 +57,7 @@ from dulwich.server import (
     serve_command,
     update_server_info,
 )
-from dulwich.tests.utils import make_commit, make_tag
+from dulwich.tests.utils import build_pack, make_commit, make_tag
 
 from . import TestCase
 
@@ -510,6 +512,330 @@ class ReceivePackHandlerTestCase(TestCase):
         # Verify hook declined the ref
         self.assertIsNotNone(ref_status)
         self.assertIn(b"update hook declined", ref_status)
+
+
+class QuarantineTestProto(TestProto):
+    """TestProto that also serves pack data through read/recv."""
+
+    def __init__(self, pack_data: bytes) -> None:
+        super().__init__()
+        self._pack = BytesIO(pack_data)
+
+    def read(self, size: int) -> bytes:
+        return self._pack.read(size)
+
+    def recv(self, size: int) -> bytes:
+        return self._pack.read(size)
+
+
+class DisconnectingTestProto(QuarantineTestProto):
+    """TestProto whose client goes away while the pack is being read."""
+
+    def read(self, size: int) -> bytes:
+        raise ConnectionResetError("client disconnected")
+
+
+class ReceivePackQuarantineTestCase(TestCase):
+    """Tests for the receive-pack object quarantine."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._repo_dir, True)
+        self._repo = Repo.init_bare(self._repo_dir)
+        self._backend = DictBackend({b"/": self._repo})
+
+    @staticmethod
+    def _make_commit(blob_data=b"contents", name=b"file.txt", parents=()):
+        blob = Blob.from_string(blob_data)
+        tree = Tree()
+        tree.add(name, 0o100644, blob.id)
+        commit = make_commit(tree=tree.id, parents=list(parents))
+        return commit, tree, blob
+
+    def _run_push(
+        self,
+        updates,
+        pack_objects=(),
+        pack_data=None,
+        capabilities=(b"report-status",),
+        proto_cls=QuarantineTestProto,
+    ):
+        """Run receive-pack for the given ref updates and pack."""
+        if pack_data is None:
+            f = BytesIO()
+            build_pack(f, [(obj.type_num, obj.as_raw_string()) for obj in pack_objects])
+            pack_data = f.getvalue()
+        proto = proto_cls(pack_data)
+        lines = []
+        for i, (old, new, ref) in enumerate(updates):
+            line = old + b" " + new + b" " + ref
+            if i == 0:
+                line += b"\0" + b" ".join(capabilities)
+            lines.append(line)
+        lines.append(None)
+        proto.set_output(lines)
+        handler = ReceivePackHandler(self._backend, [b"/"], proto)
+        handler.handle()
+        return proto
+
+    @staticmethod
+    def _status_lines(proto):
+        lines = []
+        for line in proto._received[0]:
+            if line is None:
+                continue
+            line = line.rstrip(b"\n")
+            if line.startswith((b"unpack ", b"ok ", b"ng ")):
+                lines.append(line)
+        return lines
+
+    def _quarantine_dirs(self):
+        return [
+            entry
+            for entry in os.listdir(self._repo.object_store.path)
+            if entry.startswith("incoming-")
+        ]
+
+    def test_successful_push_publishes_objects(self) -> None:
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], [commit, tree, blob]
+        )
+        status = self._status_lines(proto)
+        self.assertIn(b"unpack ok", status)
+        self.assertIn(b"ok refs/heads/master", status)
+        self.assertEqual(commit.id, self._repo.refs[b"refs/heads/master"])
+        store = self._repo.object_store
+        self.assertIn(commit.id, store)
+        self.assertIn(tree.id, store)
+        self.assertIn(blob.id, store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_pre_receive_decline_discards_objects(self) -> None:
+        mock_hook = Mock()
+        mock_hook.execute = Mock(side_effect=HookError("pre-receive declined"))
+        self._repo.hooks["pre-receive"] = mock_hook
+
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], [commit, tree, blob]
+        )
+        status = self._status_lines(proto)
+        self.assertIn(b"unpack ok", status)
+        self.assertIn(b"ng refs/heads/master pre-receive hook declined", status)
+        self.assertNotIn(b"refs/heads/master", self._repo.refs.allkeys())
+        store = self._repo.object_store
+        self.assertNotIn(commit.id, store)
+        self.assertNotIn(tree.id, store)
+        self.assertNotIn(blob.id, store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_update_hook_decline_discards_objects(self) -> None:
+        mock_hook = Mock()
+        mock_hook.execute = Mock(side_effect=HookError("update declined"))
+        self._repo.hooks["update"] = mock_hook
+
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], [commit, tree, blob]
+        )
+        status = self._status_lines(proto)
+        self.assertIn(b"unpack ok", status)
+        self.assertIn(b"ng refs/heads/master update declined", status)
+        self.assertNotIn(b"refs/heads/master", self._repo.refs.allkeys())
+        store = self._repo.object_store
+        self.assertNotIn(commit.id, store)
+        self.assertNotIn(tree.id, store)
+        self.assertNotIn(blob.id, store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_missing_referenced_objects_rejected(self) -> None:
+        # The pack inflates cleanly, but the tree references a blob that
+        # is neither in the pack nor in the repository.
+        commit, tree, blob = self._make_commit()
+        missing_blob = Blob.from_string(b"not sent anywhere")
+        tree.add(b"other.txt", 0o100644, missing_blob.id)
+        commit = make_commit(tree=tree.id)
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], [commit, tree, blob]
+        )
+        status = self._status_lines(proto)
+        self.assertIn(
+            b"unpack incomplete object graph, missing object " + missing_blob.id,
+            status,
+        )
+        self.assertFalse(any(line.startswith(b"ok ") for line in status))
+        self.assertNotIn(b"refs/heads/master", self._repo.refs.allkeys())
+        store = self._repo.object_store
+        self.assertNotIn(commit.id, store)
+        self.assertNotIn(tree.id, store)
+        self.assertNotIn(blob.id, store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_thin_pack_base_from_repository(self) -> None:
+        # External bases of a thin pack may come from the repository.
+        base_blob = Blob.from_string(b"base contents")
+        self._repo.object_store.add_object(base_blob)
+        new_data = b"base contents plus some more"
+        new_blob = Blob.from_string(new_data)
+        tree = Tree()
+        tree.add(b"file.txt", 0o100644, new_blob.id)
+        commit = make_commit(tree=tree.id)
+        f = BytesIO()
+        build_pack(
+            f,
+            [
+                (commit.type_num, commit.as_raw_string()),
+                (tree.type_num, tree.as_raw_string()),
+                (REF_DELTA, (base_blob.id, new_data)),
+            ],
+            store=self._repo.object_store,
+        )
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], pack_data=f.getvalue()
+        )
+        status = self._status_lines(proto)
+        self.assertIn(b"unpack ok", status)
+        self.assertIn(b"ok refs/heads/master", status)
+        store = self._repo.object_store
+        self.assertIn(new_blob.id, store)
+        self.assertIn(commit.id, store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_invalid_pack_discards_quarantine(self) -> None:
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")],
+            pack_data=b"this is not a pack at all",
+        )
+        status = self._status_lines(proto)
+        self.assertTrue(any(line.startswith(b"unpack ") for line in status))
+        self.assertNotIn(b"unpack ok", status)
+        self.assertNotIn(b"refs/heads/master", self._repo.refs.allkeys())
+        self.assertNotIn(commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_disconnect_discards_quarantine(self) -> None:
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")],
+            [commit, tree, blob],
+            proto_cls=DisconnectingTestProto,
+        )
+        status = self._status_lines(proto)
+        self.assertTrue(any(line.startswith(b"unpack ") for line in status))
+        self.assertNotIn(b"unpack ok", status)
+        self.assertNotIn(b"refs/heads/master", self._repo.refs.allkeys())
+        self.assertNotIn(commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_pre_receive_hook_sees_quarantined_objects(self) -> None:
+        if os.name != "posix":
+            self.skipTest("shell hook tests require a POSIX shell")
+        hooks_dir = os.path.join(self._repo.controldir(), "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        out_path = os.path.join(self._repo_dir, "hook.out")
+        hook_path = os.path.join(hooks_dir, "pre-receive")
+        with open(hook_path, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                "{\n"
+                '  echo "GIT_OBJECT_DIRECTORY=$GIT_OBJECT_DIRECTORY"\n'
+                '  echo "GIT_QUARANTINE_PATH=$GIT_QUARANTINE_PATH"\n'
+                '  echo "GIT_ALTERNATE_OBJECT_DIRECTORIES=$GIT_ALTERNATE_OBJECT_DIRECTORIES"\n'
+                '  ls "$GIT_OBJECT_DIRECTORY/pack/" | grep -c "^pack-.*[.]pack$"\n'
+                "} > " + out_path + "\n"
+            )
+        os.chmod(hook_path, 0o755)
+
+        commit, tree, blob = self._make_commit()
+        proto = self._run_push(
+            [(ZERO_SHA, commit.id, b"refs/heads/master")], [commit, tree, blob]
+        )
+        self.assertIn(b"ok refs/heads/master", self._status_lines(proto))
+
+        with open(out_path) as f:
+            lines = f.read().splitlines()
+        env = dict(line.split("=", 1) for line in lines[:3])
+        objects_dir = os.fspath(self._repo.object_store.path)
+        quarantine_dir = env["GIT_OBJECT_DIRECTORY"]
+        # The hook saw the quarantine directory, with the received pack
+        # in it, and the repository object store as alternate.
+        self.assertEqual(env["GIT_QUARANTINE_PATH"], quarantine_dir)
+        self.assertEqual(os.path.dirname(quarantine_dir), objects_dir)
+        self.assertTrue(os.path.basename(quarantine_dir).startswith("incoming-"))
+        self.assertEqual(env["GIT_ALTERNATE_OBJECT_DIRECTORIES"], objects_dir)
+        self.assertGreaterEqual(int(lines[3]), 1)
+        # After the push the quarantine is gone and the objects are in
+        # the official object store.
+        self.assertFalse(os.path.exists(quarantine_dir))
+        self.assertIn(commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_dirs())
+
+    def test_concurrent_push_cannot_use_other_quarantine(self) -> None:
+        # Push B's commit has push A's commit as parent, but B's pack
+        # does not contain it. While A's objects are still quarantined,
+        # B must not be able to reach them; once A is published, B
+        # succeeds.
+        commit_a, tree_a, blob_a = self._make_commit(b"contents a")
+        commit_b, tree_b, blob_b = self._make_commit(
+            b"contents b", parents=[commit_a.id]
+        )
+
+        a_in_hook = threading.Event()
+        release_a = threading.Event()
+
+        class BlockingPreReceive:
+            def execute(self, client_refs):
+                if any(ref == b"refs/heads/a" for _, _, ref in client_refs):
+                    a_in_hook.set()
+                    release_a.wait(30)
+                return (b"", b"")
+
+        self._repo.hooks["pre-receive"] = BlockingPreReceive()
+
+        push_a_errors = []
+
+        def push_a() -> None:
+            try:
+                self._run_push(
+                    [(ZERO_SHA, commit_a.id, b"refs/heads/a")],
+                    [commit_a, tree_a, blob_a],
+                )
+            except Exception as e:
+                push_a_errors.append(e)
+
+        thread = threading.Thread(target=push_a)
+        thread.start()
+        try:
+            self.assertTrue(a_in_hook.wait(30))
+            # A's objects are still in A's quarantine: B cannot borrow
+            # them and must fail the connectivity check.
+            proto_b = self._run_push(
+                [(ZERO_SHA, commit_b.id, b"refs/heads/b")],
+                [commit_b, tree_b, blob_b],
+            )
+            self.assertIn(
+                b"unpack incomplete object graph, missing object " + commit_a.id,
+                self._status_lines(proto_b),
+            )
+            self.assertNotIn(b"refs/heads/b", self._repo.refs.allkeys())
+            self.assertNotIn(commit_b.id, self._repo.object_store)
+        finally:
+            release_a.set()
+            thread.join(30)
+        self.assertEqual([], push_a_errors)
+        self.assertEqual(commit_a.id, self._repo.refs[b"refs/heads/a"])
+
+        # Now that A's objects are published, the same push succeeds.
+        proto_b = self._run_push(
+            [(ZERO_SHA, commit_b.id, b"refs/heads/b")],
+            [commit_b, tree_b, blob_b],
+        )
+        self.assertIn(b"ok refs/heads/b", self._status_lines(proto_b))
+        self.assertEqual(commit_b.id, self._repo.refs[b"refs/heads/b"])
+        self.assertEqual([], self._quarantine_dirs())
 
 
 class ProtocolGraphWalkerEmptyTestCase(TestCase):
