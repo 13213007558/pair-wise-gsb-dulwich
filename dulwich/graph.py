@@ -228,7 +228,7 @@ def find_merge_base(repo: "BaseRepo", commit_ids: Sequence[ObjectID]) -> list[Ob
 
     def lookup_stamp(cmtid: ObjectID) -> int:
         if cmtid not in cmtcache:
-            obj = repo.object_store[cmtid]
+            obj = parents_provider.store[cmtid]
             assert isinstance(obj, Commit)
             cmtcache[cmtid] = obj
         commit_time = cmtcache[cmtid].commit_time
@@ -272,7 +272,7 @@ def find_octopus_base(
 
     def lookup_stamp(cmtid: ObjectID) -> int:
         if cmtid not in cmtcache:
-            obj = repo.object_store[cmtid]
+            obj = parents_provider.store[cmtid]
             assert isinstance(obj, Commit)
             cmtcache[cmtid] = obj
         commit_time = cmtcache[cmtid].commit_time
@@ -320,7 +320,7 @@ def can_fast_forward(repo: "BaseRepo", c1: ObjectID, c2: ObjectID) -> bool:
 
     def lookup_stamp(cmtid: ObjectID) -> int:
         if cmtid not in cmtcache:
-            obj = repo.object_store[cmtid]
+            obj = parents_provider.store[cmtid]
             assert isinstance(obj, Commit)
             cmtcache[cmtid] = obj
         commit_time = cmtcache[cmtid].commit_time

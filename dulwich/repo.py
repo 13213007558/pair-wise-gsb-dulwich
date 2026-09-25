@@ -164,6 +164,7 @@ from .refs import (
     read_packed_refs_with_peeled,  # noqa: F401
     write_packed_refs,  # noqa: F401
 )
+from .replace import ReplacementObjectStore, parse_replace_refs
 
 logger = logging.getLogger(__name__)
 
@@ -587,6 +588,7 @@ class BaseRepo:
         self.refs = refs
 
         self._graftpoints: dict[ObjectID, list[ObjectID]] = {}
+        self._use_replace_refs = True
         self.hooks: dict[str, Hook] = {}
         if object_format is None:
             self.object_format: ObjectFormat = object_store.object_format
@@ -1057,7 +1059,48 @@ class BaseRepo:
         Raises:
           KeyError: when the object can not be found
         """
-        return self.object_store[sha]
+        return self.replacement_object_store()[sha]
+
+    @property
+    def use_replace_refs(self) -> bool:
+        """Whether object reads honor refs/replace/* replacements.
+
+        When enabled (the default, matching git), repository reads and
+        history traversal resolve replacement refs; disabling it
+        immediately restores the physical view of history.  Toggling this
+        option never modifies the underlying objects or refs.
+        """
+        return self._use_replace_refs
+
+    @use_replace_refs.setter
+    def use_replace_refs(self, value: bool) -> None:
+        self._use_replace_refs = bool(value)
+
+    @property
+    def physical_object_store(self) -> "PackCapableObjectStore":
+        """Object store that bypasses any replacement view.
+
+        This is the explicit physical read channel used by pack
+        generation and connectivity checks, so replacement contents are
+        never accidentally served as if they were the original objects.
+        """
+        return self.object_store
+
+    def replacement_object_store(self) -> "BaseObjectStore":
+        """Object store view honoring refs/replace/* replacements.
+
+        Returns the physical object store unchanged when replacement
+        refs are disabled (see the use_replace_refs property) or when no
+        replacement refs exist.  Otherwise returns a
+        ReplacementObjectStore view that resolves replacement chains on
+        read while preserving the requested object ids as identities.
+        """
+        if not self._use_replace_refs:
+            return self.object_store
+        replacements = parse_replace_refs(self.refs)
+        if not replacements:
+            return self.object_store
+        return ReplacementObjectStore(self.object_store, replacements)
 
     def parents_provider(self) -> ParentsProvider:
         """Get a parents provider for this repository.
@@ -1066,7 +1109,7 @@ class BaseRepo:
           ParentsProvider instance configured with grafts and shallows
         """
         return ParentsProvider(
-            self.object_store,
+            self.replacement_object_store(),
             grafts=self._graftpoints,
             shallows=self.get_shallow(),
         )
@@ -1273,7 +1316,7 @@ class BaseRepo:
 
         # Pass all arguments to Walker explicitly to avoid type issues with **kwargs
         return Walker(
-            self.object_store,
+            self.replacement_object_store(),
             include,
             exclude=exclude,
             order=order,
@@ -1299,10 +1342,11 @@ class BaseRepo:
         """
         if not isinstance(name, bytes):
             raise TypeError(f"'name' must be bytestring, not {type(name).__name__:.80}")
+        object_store = self.replacement_object_store()
         # If it looks like a ref name, only try refs
         if name == b"HEAD" or name.startswith(b"refs/"):
             try:
-                return self.object_store[self.refs[Ref(name)]]
+                return object_store[self.refs[Ref(name)]]
             except (RefFormatError, KeyError):
                 pass
         # Otherwise, try as object ID if length matches
@@ -1311,7 +1355,7 @@ class BaseRepo:
             self.object_store.object_format.hex_length,
         ):
             try:
-                return self.object_store[
+                return object_store[
                     ObjectID(name)
                     if len(name) == self.object_store.object_format.hex_length
                     else RawObjectID(name)
@@ -1329,7 +1373,10 @@ class BaseRepo:
         """
         # Check if it's a binary or hex SHA
         if len(name) == self.object_format.hex_length and valid_hexsha(name):
-            return ObjectID(name) in self.object_store or Ref(name) in self.refs
+            return (
+                ObjectID(name) in self.replacement_object_store()
+                or Ref(name) in self.refs
+            )
         return Ref(name) in self.refs
 
     def __setitem__(self, name: bytes, value: ShaFile | bytes) -> None:

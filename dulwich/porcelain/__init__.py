@@ -6948,8 +6948,11 @@ def fsck(repo: RepoPath | None = None) -> Iterator[tuple[bytes, Exception]]:
         # TODO(jelmer): check pack files
         # TODO(jelmer): check graph (excluding commits beyond shallow boundary)
         # TODO(jelmer): check refs
-        for sha in r.object_store:
-            o = r.object_store[sha]
+        # Connectivity checks always run against the physical object
+        # store, bypassing any refs/replace/* replacement view.
+        store = r.physical_object_store
+        for sha in store:
+            o = store[sha]
             try:
                 o.check()
             except Exception as e:

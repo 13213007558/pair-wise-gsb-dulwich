@@ -9749,6 +9749,16 @@ class FsckTests(PorcelainTestCase):
     def test_none(self) -> None:
         self.assertEqual([], list(porcelain.fsck(self.repo)))
 
+    def test_replace_refs_use_physical_store(self) -> None:
+        # Replacement refs (including dangling ones) must not affect the
+        # connectivity check, which reads the physical object store.
+        blob = Blob()
+        blob.data = b"foo"
+        self.repo.object_store.add_object(blob)
+        self.repo.refs[b"refs/replace/" + b"1" * 40] = blob.id
+        self.repo.refs[b"refs/replace/" + blob.id] = b"2" * 40
+        self.assertEqual([], list(porcelain.fsck(self.repo)))
+
     def test_git_dir(self) -> None:
         obj = Tree()
         a = Blob()

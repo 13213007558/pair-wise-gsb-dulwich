@@ -1,5 +1,14 @@
 1.2.16	UNRELEASED
 
+ * Honor ``refs/replace/*`` on repository reads. A new
+   ``ReplacementObjectStore`` view (``dulwich.replace``) resolves
+   replacement chains across multiple hops, preserves the requested object
+   id as the displayed identity, and reports cycles, missing targets and
+   type mismatches with the original object id. ``BaseRepo`` gained
+   ``use_replace_refs`` to toggle the view, ``replacement_object_store()``
+   to obtain it, and ``physical_object_store`` as the explicit physical
+   read channel used by pack generation and connectivity checks.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and

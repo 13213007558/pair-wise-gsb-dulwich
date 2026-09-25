@@ -249,6 +249,7 @@ def self_test_suite() -> unittest.TestSuite:
         "rebase",
         "reflog",
         "refs",
+        "replace",
         "reftable",
         "repository",
         "rerere",
