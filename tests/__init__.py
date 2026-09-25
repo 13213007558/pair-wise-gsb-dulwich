@@ -247,6 +247,7 @@ def self_test_suite() -> unittest.TestSuite:
         "protocol",
         "range_diff",
         "rebase",
+        "replace",
         "reflog",
         "refs",
         "reftable",

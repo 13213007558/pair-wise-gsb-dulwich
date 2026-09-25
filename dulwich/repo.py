@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from .object_store import BaseObjectStore, GraphWalker
     from .pack import UnpackedObject
     from .rebase import RebaseStateManager
+    from .replace import ReplacementRepoView
     from .walk import Walker
     from .worktree import WorkTree
 
@@ -1070,6 +1071,27 @@ class BaseRepo:
             grafts=self._graftpoints,
             shallows=self.get_shallow(),
         )
+
+    def replacement_view(self, *, enabled: bool = True) -> "ReplacementRepoView":
+        """Get a read-through view of this repository applying refs/replace/.
+
+        The returned view shares this repository's refs and physical object
+        store, but resolves replacement refs on read, so that traversal APIs
+        (get_walker, parents_provider, get_object, dulwich.graph helpers)
+        operate on the replaced history. This repository itself is never
+        modified: its object_store remains the physical channel to use for
+        packing and connectivity checks, and disabling or dropping the view
+        immediately restores the physical history.
+
+        Args:
+          enabled: Whether replacements are applied initially.
+
+        Returns:
+          ReplacementRepoView instance
+        """
+        from .replace import ReplacementRepoView
+
+        return ReplacementRepoView(self, enabled=enabled)
 
     def get_parents(
         self, sha: ObjectID, commit: Commit | None = None
