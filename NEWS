@@ -1,5 +1,12 @@
 1.2.16	UNRELEASED
 
+ * Read split (layered) commit graph chains written by e.g.
+   ``git commit-graph write --split``. ``DiskObjectStore.get_commit_graph``
+   now assembles the layers listed in ``commit-graph-chain``, resolving
+   cross-layer parent positions, octopus merges and generation data, and
+   falls back to plain object traversal when the chain is missing layers
+   or fails validation. (Jelmer Vernooĳ)
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and

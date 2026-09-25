@@ -132,7 +132,7 @@ from .refs import Ref
 
 if TYPE_CHECKING:
     from .bitmap import EWAHBitmap
-    from .commit_graph import CommitGraph
+    from .commit_graph import CommitGraph, CommitGraphChain
     from .config import Config
     from .diff_tree import RenameDetector
     from .pack import FilePackIndex, Pack
@@ -867,11 +867,11 @@ class BaseObjectStore:
             if sha.startswith(prefix):
                 yield sha
 
-    def get_commit_graph(self) -> "CommitGraph | None":
+    def get_commit_graph(self) -> "CommitGraph | CommitGraphChain | None":
         """Get the commit graph for this object store.
 
         Returns:
-          CommitGraph object if available, None otherwise
+          CommitGraph or CommitGraphChain object if available, None otherwise
         """
         return None
 
@@ -1654,7 +1654,7 @@ class DiskObjectStore(PackBasedObjectStore):
     path: str | os.PathLike[str]
     pack_dir: str | os.PathLike[str]
     _alternates: "list[BaseObjectStore] | None"
-    _commit_graph: "CommitGraph | None"
+    _commit_graph: "CommitGraph | CommitGraphChain | None"
 
     def __init__(
         self,
@@ -2561,23 +2561,48 @@ class DiskObjectStore(PackBasedObjectStore):
                     seen.add(sha)
                     yield sha
 
-    def get_commit_graph(self) -> "CommitGraph | None":
+    def get_commit_graph(self) -> "CommitGraph | CommitGraphChain | None":
         """Get the commit graph for this object store.
 
         Returns:
-          CommitGraph object if available, None otherwise
+          CommitGraph or CommitGraphChain object if available, None otherwise
         """
         if not self._use_commit_graph:
             return None
 
         if self._commit_graph is None:
-            from .commit_graph import read_commit_graph
-
-            # Look for commit graph in our objects directory
-            graph_file = os.path.join(self.path, "info", "commit-graph")
-            if os.path.exists(graph_file):
-                self._commit_graph = read_commit_graph(graph_file)
+            self._commit_graph = self._read_commit_graph()
         return self._commit_graph
+
+    def _read_commit_graph(self) -> "CommitGraph | CommitGraphChain | None":
+        """Read the commit graph or commit graph chain from disk.
+
+        A split (layered) commit graph chain, as written by e.g.
+        git commit-graph write --split, takes precedence over a single
+        commit-graph file, matching C Git's behaviour.
+
+        If the chain or graph cannot be read or fails validation (for
+        example because a concurrent maintenance process replaced it
+        mid-read), None is returned so callers fall back to traversing
+        the object database directly.
+        """
+        from .commit_graph import read_commit_graph, read_commit_graph_chain
+
+        chain_file = os.path.join(
+            self.path, "info", "commit-graphs", "commit-graph-chain"
+        )
+        graph_file = os.path.join(self.path, "info", "commit-graph")
+        try:
+            if os.path.exists(chain_file):
+                return read_commit_graph_chain(chain_file)
+            if os.path.exists(graph_file):
+                return read_commit_graph(graph_file)
+        except (OSError, ValueError):
+            # Broken or concurrently replaced commit graph: fall back to
+            # reading commit objects instead of returning incomplete
+            # ancestry.
+            return None
+        return None
 
     def get_midx(self) -> MultiPackIndex | None:
         """Get the multi-pack-index for this object store.

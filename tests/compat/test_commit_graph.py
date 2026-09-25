@@ -28,9 +28,16 @@ identically to C Git's implementation.
 import os
 import tempfile
 
-from dulwich.commit_graph import find_commit_graph_file, read_commit_graph
+from dulwich.commit_graph import (
+    CommitGraphChain,
+    find_commit_graph_chain_file,
+    find_commit_graph_file,
+    read_commit_graph,
+    read_commit_graph_chain,
+)
 from dulwich.graph import can_fast_forward, find_merge_base
-from dulwich.repo import Repo
+from dulwich.object_store import find_shallow
+from dulwich.repo import ParentsProvider, Repo
 
 from .utils import CompatTestCase, remove_ro, rmtree_ro, run_git, run_git_or_fail
 
@@ -474,3 +481,271 @@ class CommitGraphCompatTests(CompatTestCase):
             self.assertEqual(
                 len(commit_graph), 0, "Empty repository should have empty commit graph"
             )
+
+
+class SplitCommitGraphCompatTests(CompatTestCase):
+    """Compatibility tests for split (layered) commit graph chains.
+
+    These tests build a repository whose commit graph is stored as a chain
+    of incremental layers by C Git's git commit-graph write --split, with
+    merges (including an octopus merge) whose parents live in lower layers,
+    and verify that dulwich reads the chain identically to reading the
+    commit objects directly.
+    """
+
+    # Commit graph chains (git commit-graph write --split) were introduced
+    # in Git 2.24.0
+    min_git_version = (2, 24, 0)
+
+    def setUp(self):
+        super().setUp()
+        self.test_dir = tempfile.mkdtemp()
+        self.repo_path = os.path.join(self.test_dir, "test-repo")
+
+        # Set up git identity to avoid committer identity errors
+        self.overrideEnv("GIT_COMMITTER_NAME", "Test Author")
+        self.overrideEnv("GIT_COMMITTER_EMAIL", "test@example.com")
+        self.overrideEnv("GIT_AUTHOR_NAME", "Test Author")
+        self.overrideEnv("GIT_AUTHOR_EMAIL", "test@example.com")
+
+    def tearDown(self):
+        rmtree_ro(self.test_dir)
+
+    def _commit(self, work_dir, filename, message, date):
+        """Create a commit adding a new file with a fixed committer date."""
+        with open(os.path.join(work_dir, filename), "w") as f:
+            f.write(f"Content of {filename}\n")
+        run_git_or_fail(["add", filename], cwd=work_dir)
+        env = {
+            "GIT_AUTHOR_DATE": date,
+            "GIT_COMMITTER_DATE": date,
+        }
+        run_git_or_fail(["commit", "-m", message], cwd=work_dir, env=env)
+        return run_git_or_fail(["rev-parse", "HEAD"], cwd=work_dir).strip()
+
+    def _merge(self, work_dir, branches, message, date):
+        """Merge the given branches with a fixed committer date."""
+        env = {
+            "GIT_AUTHOR_DATE": date,
+            "GIT_COMMITTER_DATE": date,
+        }
+        run_git_or_fail(
+            ["merge", "--no-ff", "-m", message, *branches], cwd=work_dir, env=env
+        )
+        return run_git_or_fail(["rev-parse", "HEAD"], cwd=work_dir).strip()
+
+    def _write_split_layer(self, work_dir):
+        run_git_or_fail(
+            ["commit-graph", "write", "--reachable", "--split=no-merge"],
+            cwd=work_dir,
+        )
+
+    def create_split_graph_repo(self):
+        """Create a repository with a 3-layer split commit graph chain.
+
+        The history contains an octopus merge and a regular merge whose
+        parents live in lower layers of the chain.
+        """
+        run_git_or_fail(["init"], cwd=self.test_dir)
+        os.rename(os.path.join(self.test_dir, ".git"), self.repo_path)
+
+        work_dir = os.path.join(self.test_dir, "work")
+        os.makedirs(work_dir)
+        with open(os.path.join(work_dir, ".git"), "w") as f:
+            f.write(f"gitdir: {self.repo_path}\n")
+
+        commits = {}
+
+        # Batch 1 (layer 1): three commits on master
+        for i in range(3):
+            commits[f"c{i}"] = self._commit(
+                work_dir,
+                f"file{i}.txt",
+                f"Commit {i}",
+                f"2024-01-0{i + 1} 12:00:00 +0000",
+            )
+        self._write_split_layer(work_dir)
+
+        # Batch 2 (layer 2): a side branch and another commit on master
+        run_git_or_fail(["checkout", "-b", "side-a"], cwd=work_dir)
+        commits["a1"] = self._commit(
+            work_dir, "side-a.txt", "Side A commit", "2024-01-04 12:00:00 +0000"
+        )
+        run_git_or_fail(["checkout", "master"], cwd=work_dir)
+        commits["c4"] = self._commit(
+            work_dir, "file4.txt", "Commit 4", "2024-01-05 12:00:00 +0000"
+        )
+        self._write_split_layer(work_dir)
+
+        # Batch 3 (layer 3): an octopus merge spanning layers 2 and 3, and
+        # a regular merge reaching back into layer 1
+        run_git_or_fail(["checkout", "-b", "side-b"], cwd=work_dir)
+        commits["b1"] = self._commit(
+            work_dir, "side-b.txt", "Side B commit", "2024-01-06 12:00:00 +0000"
+        )
+        run_git_or_fail(["checkout", "master"], cwd=work_dir)
+        commits["octo"] = self._merge(
+            work_dir, ["side-a", "side-b"], "Octopus merge", "2024-01-07 12:00:00 +0000"
+        )
+        run_git_or_fail(["checkout", "-b", "old", commits["c1"]], cwd=work_dir)
+        commits["o1"] = self._commit(
+            work_dir, "old.txt", "Old branch commit", "2024-01-08 12:00:00 +0000"
+        )
+        run_git_or_fail(["checkout", "master"], cwd=work_dir)
+        commits["m2"] = self._merge(
+            work_dir, ["old"], "Merge old branch", "2024-01-09 12:00:00 +0000"
+        )
+        self._write_split_layer(work_dir)
+
+        return commits, work_dir
+
+    def _snapshot_graph_files(self):
+        """Record the contents of all commit graph files in the repository."""
+        info_dir = os.path.join(self.repo_path, "objects", "info")
+        snapshot = {}
+        for dirpath, _dirnames, filenames in os.walk(info_dir):
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                with open(path, "rb") as f:
+                    snapshot[path] = f.read()
+        return snapshot
+
+    def _all_commit_shas(self, work_dir):
+        output = run_git_or_fail(["rev-list", "HEAD"], cwd=work_dir)
+        return output.strip().split(b"\n")
+
+    def test_split_commit_graph_chain(self):
+        """Dulwich reads a split commit graph chain like C Git does."""
+        commits, work_dir = self.create_split_graph_repo()
+
+        # The chain file lists three layers, one per --split write
+        chain_file = find_commit_graph_chain_file(self.repo_path)
+        self.assertIsNotNone(chain_file, "commit-graph-chain file should exist")
+        with open(chain_file, "rb") as f:
+            layer_hashes = [line.strip() for line in f if line.strip()]
+        self.assertEqual(len(layer_hashes), 3, "Expected a 3-layer commit graph chain")
+        graphs_dir = os.path.join(self.repo_path, "objects", "info", "commit-graphs")
+        for layer_hash in layer_hashes:
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(graphs_dir, "graph-" + layer_hash.decode() + ".graph")
+                ),
+                f"Layer file for {layer_hash!r} should exist",
+            )
+
+        # The chain can be read directly
+        chain = read_commit_graph_chain(chain_file)
+        self.assertIsNotNone(chain)
+        self.assertEqual(len(chain.layers), 3)
+
+        # And is picked up automatically by the object store
+        repo = Repo(self.repo_path)
+        self.addCleanup(repo.close)
+        graph = repo.object_store.get_commit_graph()
+        self.assertIsInstance(graph, CommitGraphChain)
+        self.assertEqual(len(graph.layers), 3)
+
+        snapshot_before = self._snapshot_graph_files()
+
+        # Every commit's parents match the commit objects exactly,
+        # including cross-layer parents and the octopus merge
+        all_shas = self._all_commit_shas(work_dir)
+        self.assertEqual(len(all_shas), len(chain))
+        for sha in all_shas:
+            commit_obj = repo.object_store[sha]
+            self.assertEqual(
+                graph.get_parents(sha),
+                list(commit_obj.parents),
+                f"Parent mismatch for commit {sha.decode()}",
+            )
+
+        # The octopus merge has all three parents, in order
+        octo_parents = graph.get_parents(commits["octo"])
+        self.assertEqual(len(octo_parents), 3)
+        self.assertEqual(
+            octo_parents,
+            [commits["c4"], commits["a1"], commits["b1"]],
+            "Octopus merge parents should span layers in order",
+        )
+
+        # The regular merge reaches back into the base layer
+        self.assertEqual(
+            graph.get_parents(commits["o1"]),
+            [commits["c1"]],
+            "Commit on the old branch should point into the base layer",
+        )
+
+        # Generation numbers are available and consistent with ancestry
+        for sha in all_shas:
+            generation = graph.get_generation_number(sha)
+            self.assertIsNotNone(generation)
+            for parent in graph.get_parents(sha):
+                self.assertGreater(
+                    generation,
+                    graph.get_generation_number(parent),
+                    f"Generation of {sha.decode()} should exceed its parent's",
+                )
+
+        # Ancestor traversal through the graph matches object traversal
+        provider = ParentsProvider(repo.object_store)
+        for sha in all_shas:
+            self.assertEqual(
+                provider.get_parents(sha),
+                list(repo.object_store[sha].parents),
+                f"ParentsProvider mismatch for commit {sha.decode()}",
+            )
+
+        head = run_git_or_fail(["rev-parse", "HEAD"], cwd=work_dir).strip()
+        shallow_with_graph, not_shallow_with_graph = find_shallow(
+            repo.object_store, [head], 3
+        )
+        repo.object_store._commit_graph = None
+        repo.object_store._use_commit_graph = False
+        shallow_without_graph, not_shallow_without_graph = find_shallow(
+            repo.object_store, [head], 3
+        )
+        self.assertEqual(shallow_with_graph, shallow_without_graph)
+        self.assertEqual(not_shallow_with_graph, not_shallow_without_graph)
+
+        # The repository is only read: the graph files are byte-identical
+        # and no single-layer commit-graph file was written
+        self.assertEqual(snapshot_before, self._snapshot_graph_files())
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.repo_path, "objects", "info", "commit-graph")
+            ),
+            "Reading the chain must not rewrite it as a single layer",
+        )
+
+    def test_split_commit_graph_missing_layer_falls_back(self):
+        """A broken chain falls back to object traversal, not partial results."""
+        commits, work_dir = self.create_split_graph_repo()
+
+        # Remove the top layer, as happens when a maintenance process
+        # replaces the chain between reads
+        chain_file = find_commit_graph_chain_file(self.repo_path)
+        with open(chain_file, "rb") as f:
+            layer_hashes = [line.strip() for line in f if line.strip()]
+        graphs_dir = os.path.join(self.repo_path, "objects", "info", "commit-graphs")
+        os.remove(
+            os.path.join(graphs_dir, "graph-" + layer_hashes[-1].decode() + ".graph")
+        )
+
+        repo = Repo(self.repo_path)
+        self.addCleanup(repo.close)
+
+        # The broken chain is not used
+        self.assertIsNone(repo.object_store.get_commit_graph())
+
+        # Ancestor queries still return complete results from the objects
+        provider = ParentsProvider(repo.object_store)
+        for sha in self._all_commit_shas(work_dir):
+            self.assertEqual(
+                provider.get_parents(sha),
+                list(repo.object_store[sha].parents),
+                f"ParentsProvider mismatch for commit {sha.decode()}",
+            )
+        self.assertEqual(
+            provider.get_parents(commits["octo"]),
+            [commits["c4"], commits["a1"], commits["b1"]],
+        )

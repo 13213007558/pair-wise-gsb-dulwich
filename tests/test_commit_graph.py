@@ -29,23 +29,30 @@ import tempfile
 import unittest
 
 from dulwich.commit_graph import (
+    CHUNK_BASE_GRAPHS_LIST,
     CHUNK_COMMIT_DATA,
     CHUNK_EXTRA_EDGE_LIST,
+    CHUNK_GENERATION_DATA,
+    CHUNK_GENERATION_DATA_OVERFLOW,
     CHUNK_OID_FANOUT,
     CHUNK_OID_LOOKUP,
     COMMIT_GRAPH_SIGNATURE,
     COMMIT_GRAPH_VERSION,
+    GENERATION_NUMBER_V2_OVERFLOW,
     GRAPH_EXTRA_EDGES_NEEDED,
     GRAPH_LAST_EDGE,
     GRAPH_PARENT_MISSING,
     HASH_VERSION_SHA1,
     CommitGraph,
+    CommitGraphChain,
     CommitGraphChunk,
     CommitGraphEntry,
+    find_commit_graph_chain_file,
     find_commit_graph_file,
     generate_commit_graph,
     get_reachable_commits,
     read_commit_graph,
+    read_commit_graph_chain,
 )
 from dulwich.graph import can_fast_forward, find_merge_base
 from dulwich.object_format import SHA1
@@ -1041,6 +1048,374 @@ class CommitGraphGenerationTests(unittest.TestCase):
         )
         self.assertEqual(
             result_with_graph, [commits[0].id], "Merge base should be the first commit"
+        )
+
+
+class CommitGraphChainTests(unittest.TestCase):
+    """Tests for split (layered) commit graph chains."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+        self.objects_dir = os.path.join(self.tempdir, "objects")
+        self.chain_dir = os.path.join(self.objects_dir, "info", "commit-graphs")
+        os.makedirs(self.chain_dir)
+
+    @staticmethod
+    def _oid(seed: int) -> bytes:
+        return bytes([seed]) * 20
+
+    @staticmethod
+    def _hex(oid: bytes) -> bytes:
+        return sha_to_hex(oid)
+
+    def _write_layer(
+        self,
+        layer_hash: str,
+        commits: list[tuple[bytes, bytes, int, int, int, int]],
+        *,
+        base_hashes: tuple[str, ...] = (),
+        extra_edges: bytes | None = None,
+        generation_v2: list[int] | None = None,
+        generation_overflow: bytes | None = None,
+    ) -> str:
+        """Write a graph-{layer_hash}.graph file.
+
+        Args:
+          layer_hash: Hex hash identifying the layer
+          commits: List of (oid, tree_oid, parent1_pos, parent2_pos,
+            generation, commit_time) tuples, in commit graph position order.
+            Parent positions are stored as-is and may refer to lower layers.
+          base_hashes: Hex hashes of the layers below this one, written to
+            the BASE chunk
+          extra_edges: Raw contents of the extra edge list chunk
+          generation_v2: Corrected committer dates for the GDA2 chunk
+          generation_overflow: Raw contents of the GDO2 chunk
+
+        Returns: Path to the written layer file
+        """
+        oids = [commit[0] for commit in commits]
+
+        fanout_counts = [0] * 256
+        count = 0
+        for i in range(256):
+            count += sum(1 for oid in oids if oid[0] == i)
+            fanout_counts[i] = count
+        fanout_data = b"".join(struct.pack(">L", c) for c in fanout_counts)
+
+        oid_data = b"".join(oids)
+
+        commit_data = b""
+        for (
+            _oid,
+            tree_oid,
+            parent1_pos,
+            parent2_pos,
+            generation,
+            commit_time,
+        ) in commits:
+            gen_and_time = (generation << 2) | (commit_time >> 32)
+            commit_data += (
+                tree_oid
+                + struct.pack(">LL", parent1_pos, parent2_pos)
+                + struct.pack(">LL", gen_and_time, commit_time & 0xFFFFFFFF)
+            )
+
+        chunk_list = [
+            (CHUNK_OID_FANOUT, fanout_data),
+            (CHUNK_OID_LOOKUP, oid_data),
+            (CHUNK_COMMIT_DATA, commit_data),
+        ]
+        if extra_edges is not None:
+            chunk_list.append((CHUNK_EXTRA_EDGE_LIST, extra_edges))
+        if generation_v2 is not None:
+            chunk_list.append(
+                (
+                    CHUNK_GENERATION_DATA,
+                    b"".join(struct.pack(">L", g) for g in generation_v2),
+                )
+            )
+        if generation_overflow is not None:
+            chunk_list.append((CHUNK_GENERATION_DATA_OVERFLOW, generation_overflow))
+        if base_hashes:
+            chunk_list.append(
+                (
+                    CHUNK_BASE_GRAPHS_LIST,
+                    b"".join(bytes.fromhex(h) for h in base_hashes),
+                )
+            )
+
+        header = (
+            COMMIT_GRAPH_SIGNATURE
+            + struct.pack(">B", COMMIT_GRAPH_VERSION)
+            + struct.pack(">B", HASH_VERSION_SHA1)
+            + struct.pack(">B", len(chunk_list))
+            + struct.pack(">B", len(base_hashes))
+        )
+
+        offset = 8 + (len(chunk_list) + 1) * 12
+        toc = b""
+        data = b""
+        for chunk_id, chunk_data in chunk_list:
+            toc += chunk_id + struct.pack(">Q", offset)
+            data += chunk_data
+            offset += len(chunk_data)
+        toc += b"\x00\x00\x00\x00" + struct.pack(">Q", offset)
+
+        layer_path = os.path.join(self.chain_dir, f"graph-{layer_hash}.graph")
+        with open(layer_path, "wb") as f:
+            f.write(header + toc + data)
+        return layer_path
+
+    def _write_chain(self, layer_hashes: list[str]) -> str:
+        """Write a commit-graph-chain file listing the given layer hashes."""
+        chain_path = os.path.join(self.chain_dir, "commit-graph-chain")
+        with open(chain_path, "wb") as f:
+            for layer_hash in layer_hashes:
+                f.write(layer_hash.encode() + b"\n")
+        return chain_path
+
+    def test_chain_assembly_cross_layer_parents(self) -> None:
+        """Parents in a higher layer can point into lower layers."""
+        c0, c1, c2, c3 = (self._oid(0x10 + i) for i in range(4))
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        # Layer A: c0 (root), c1 (parent c0 at position 0)
+        self._write_layer(
+            layer_a,
+            [
+                (c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000),
+                (c1, tree, 0, GRAPH_PARENT_MISSING, 2, 1001),
+            ],
+        )
+        # Layer B: c2 (parent c1 at position 1 in the base layer's
+        # position space), c3 (parent c2: own position 0, stored after
+        # the 2 commits of the base layer as position 2)
+        self._write_layer(
+            layer_b,
+            [
+                (c2, tree, 1, GRAPH_PARENT_MISSING, 3, 1002),
+                (c3, tree, 2, GRAPH_PARENT_MISSING, 4, 1003),
+            ],
+            base_hashes=(layer_a,),
+        )
+        chain_path = self._write_chain([layer_a, layer_b])
+
+        chain = read_commit_graph_chain(chain_path)
+        self.assertIsNotNone(chain)
+        assert chain is not None
+        self.assertIsInstance(chain, CommitGraphChain)
+        self.assertEqual(len(chain.layers), 2)
+        self.assertEqual(len(chain), 4)
+
+        self.assertEqual(chain.get_parents(self._hex(c0)), [])
+        self.assertEqual(chain.get_parents(self._hex(c1)), [self._hex(c0)])
+        # Cross-layer parent: c2 -> c1 in the base layer
+        self.assertEqual(chain.get_parents(self._hex(c2)), [self._hex(c1)])
+        self.assertEqual(chain.get_parents(self._hex(c3)), [self._hex(c2)])
+        self.assertIsNone(chain.get_parents(self._hex(self._oid(0xFF))))
+
+    def test_chain_octopus_merge_across_layers(self) -> None:
+        """Octopus merges resolve extra edges across layers."""
+        c0, c1, c2, c3 = (self._oid(0x20 + i) for i in range(4))
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        # Layer A: c0 and c1, both roots
+        self._write_layer(
+            layer_a,
+            [
+                (c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000),
+                (c1, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1001),
+            ],
+        )
+        # Layer B: c2 (parent c0 at position 0 in the base layer's
+        # position space), c3 octopus merge with parents c2 (own
+        # position 0, stored as 2 after the base layer's commits), c0
+        # and c1 (base layer positions 0 and 1 via the extra edge list)
+        extra_edges = struct.pack(">L", 0) + struct.pack(">L", 1 | GRAPH_LAST_EDGE)
+        self._write_layer(
+            layer_b,
+            [
+                (c2, tree, 0, GRAPH_PARENT_MISSING, 2, 1002),
+                (c3, tree, 2, GRAPH_EXTRA_EDGES_NEEDED | 0, 3, 1003),
+            ],
+            base_hashes=(layer_a,),
+            extra_edges=extra_edges,
+        )
+        chain_path = self._write_chain([layer_a, layer_b])
+
+        chain = read_commit_graph_chain(chain_path)
+        self.assertIsNotNone(chain)
+        assert chain is not None
+        self.assertEqual(
+            chain.get_parents(self._hex(c3)),
+            [self._hex(c2), self._hex(c0), self._hex(c1)],
+        )
+
+    def test_chain_missing_layer_raises(self) -> None:
+        """A chain referencing a missing layer file cannot be read."""
+        c0 = self._oid(0x30)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        self._write_layer(
+            layer_a,
+            [(c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000)],
+        )
+        # Chain references layer B, which was never written (e.g. a
+        # concurrent maintenance process replaced the chain)
+        chain_path = self._write_chain([layer_a, layer_b])
+
+        with self.assertRaises(OSError):
+            read_commit_graph_chain(chain_path)
+
+    def test_chain_base_mismatch_raises(self) -> None:
+        """A layer whose base graphs do not match the chain file is rejected."""
+        c0, c1 = self._oid(0x40), self._oid(0x41)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        self._write_layer(
+            layer_a,
+            [(c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000)],
+        )
+        # Layer B claims a different base graph than the chain file lists
+        self._write_layer(
+            layer_b,
+            [(c1, tree, 1, GRAPH_PARENT_MISSING, 2, 1001)],
+            base_hashes=("c" * 40,),
+        )
+        chain_path = self._write_chain([layer_a, layer_b])
+
+        with self.assertRaises(ValueError):
+            read_commit_graph_chain(chain_path)
+
+    def test_empty_chain_file_raises(self) -> None:
+        """An empty chain file is invalid."""
+        chain_path = self._write_chain([])
+
+        with self.assertRaises(ValueError):
+            read_commit_graph_chain(chain_path)
+
+    def test_get_commit_graph_falls_back_on_missing_layer(self) -> None:
+        """DiskObjectStore falls back to object traversal for broken chains."""
+        c0 = self._oid(0x50)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        self._write_layer(
+            layer_a,
+            [(c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000)],
+        )
+        self._write_chain([layer_a, layer_b])
+
+        store = DiskObjectStore(self.objects_dir)
+        self.assertIsNone(store.get_commit_graph())
+
+    def test_get_commit_graph_falls_back_on_invalid_layer(self) -> None:
+        """DiskObjectStore falls back when a layer fails validation."""
+        c0, c1 = self._oid(0x60), self._oid(0x61)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        self._write_layer(
+            layer_a,
+            [(c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000)],
+        )
+        self._write_layer(
+            layer_b,
+            [(c1, tree, 1, GRAPH_PARENT_MISSING, 2, 1001)],
+            base_hashes=("c" * 40,),
+        )
+        self._write_chain([layer_a, layer_b])
+
+        store = DiskObjectStore(self.objects_dir)
+        self.assertIsNone(store.get_commit_graph())
+
+    def test_get_commit_graph_reads_chain(self) -> None:
+        """DiskObjectStore assembles a valid chain without rewriting it."""
+        c0, c1 = self._oid(0x70), self._oid(0x71)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+        layer_b = "b" * 40
+
+        layer_a_path = self._write_layer(
+            layer_a,
+            [(c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000)],
+        )
+        layer_b_path = self._write_layer(
+            layer_b,
+            [(c1, tree, 0, GRAPH_PARENT_MISSING, 2, 1001)],
+            base_hashes=(layer_a,),
+        )
+        chain_path = self._write_chain([layer_a, layer_b])
+
+        with open(layer_a_path, "rb") as f:
+            layer_a_contents = f.read()
+        with open(layer_b_path, "rb") as f:
+            layer_b_contents = f.read()
+        with open(chain_path, "rb") as f:
+            chain_contents = f.read()
+
+        store = DiskObjectStore(self.objects_dir)
+        graph = store.get_commit_graph()
+        self.assertIsInstance(graph, CommitGraphChain)
+        assert isinstance(graph, CommitGraphChain)
+        self.assertEqual(graph.get_parents(self._hex(c1)), [self._hex(c0)])
+
+        # Reading the chain must not rewrite the repository as a single
+        # layer or otherwise modify the graph files
+        self.assertFalse(
+            os.path.exists(os.path.join(self.objects_dir, "info", "commit-graph"))
+        )
+        with open(layer_a_path, "rb") as f:
+            self.assertEqual(f.read(), layer_a_contents)
+        with open(layer_b_path, "rb") as f:
+            self.assertEqual(f.read(), layer_b_contents)
+        with open(chain_path, "rb") as f:
+            self.assertEqual(f.read(), chain_contents)
+
+    def test_generation_data_v2(self) -> None:
+        """Generation data chunks override v1 generation numbers."""
+        c0, c1 = self._oid(0x80), self._oid(0x81)
+        tree = self._oid(0xF0)
+        layer_a = "a" * 40
+
+        overflow_date = 0x1_0000_0001  # Does not fit in 32 bits
+        self._write_layer(
+            layer_a,
+            [
+                (c0, tree, GRAPH_PARENT_MISSING, GRAPH_PARENT_MISSING, 1, 1000),
+                (c1, tree, 0, GRAPH_PARENT_MISSING, 2, 1001),
+            ],
+            generation_v2=[500, GENERATION_NUMBER_V2_OVERFLOW | 0],
+            generation_overflow=struct.pack(">Q", overflow_date),
+        )
+        chain_path = self._write_chain([layer_a])
+
+        chain = read_commit_graph_chain(chain_path)
+        self.assertIsNotNone(chain)
+        assert chain is not None
+        # The corrected committer date is the committer date plus the
+        # offset from the generation data chunk
+        self.assertEqual(chain.get_generation_number(self._hex(c0)), 1000 + 500)
+        self.assertEqual(chain.get_generation_number(self._hex(c1)), overflow_date)
+
+    def test_find_commit_graph_chain_file(self) -> None:
+        """find_commit_graph_chain_file locates the chain file."""
+        self.assertIsNone(find_commit_graph_chain_file(self.tempdir))
+
+        chain_path = self._write_chain(["a" * 40])
+        self.assertEqual(
+            find_commit_graph_chain_file(self.tempdir), chain_path.encode()
         )
 
 
