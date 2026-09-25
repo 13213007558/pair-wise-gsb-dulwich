@@ -187,6 +187,22 @@ def parse_remote_ref(ref: bytes) -> tuple[bytes, bytes]:
     return (remote_name, branch_name)
 
 
+def _ref_value_matches(current: bytes | None, expected: bytes) -> bool:
+    """Check whether a possibly missing ref value matches an expected value.
+
+    A missing ref matches an all-zero object id of either hash length
+    (SHA-1 or SHA-256), matching git's "must not exist" semantics.
+
+    Args:
+      current: The current ref value, or None if the ref does not exist.
+      expected: The value to compare against.
+    Returns: True if the values should be considered equal.
+    """
+    if current is None:
+        return expected.strip(b"0") == b""
+    return current == expected
+
+
 def set_ref_from_raw(refs: "RefsContainer", name: Ref, raw_ref: bytes) -> None:
     """Set a reference from a raw ref value.
 
@@ -741,7 +757,9 @@ class DictRefsContainer(RefsContainer):
           True if the set was successful, False otherwise.
         """
         self._check_ref_value(new_ref)
-        if old_ref is not None and self._refs.get(name, ZERO_SHA) != old_ref:
+        if old_ref is not None and not _ref_value_matches(
+            self._refs.get(name), old_ref
+        ):
             return False
         # Only update the specific ref requested, not the whole chain
         self._check_refname(name)
@@ -823,7 +841,9 @@ class DictRefsContainer(RefsContainer):
         Returns:
           True if the delete was successful, False otherwise.
         """
-        if old_ref is not None and self._refs.get(name, ZERO_SHA) != old_ref:
+        if old_ref is not None and not _ref_value_matches(
+            self._refs.get(name), old_ref
+        ):
             return False
         try:
             old = self._refs.pop(name)
@@ -1263,8 +1283,8 @@ class DiskRefsContainer(RefsContainer):
                     # read again while holding the lock to handle race conditions
                     orig_ref = self.read_loose_ref(realname)
                     if orig_ref is None:
-                        orig_ref = self.get_packed_refs().get(realname, ZERO_SHA)
-                    if orig_ref != old_ref:
+                        orig_ref = self.get_packed_refs().get(realname)
+                    if not _ref_value_matches(orig_ref, old_ref):
                         f.abort()
                         return False
                 except OSError:
@@ -1386,9 +1406,7 @@ class DiskRefsContainer(RefsContainer):
                 orig_ref = self.read_loose_ref(name)
                 if orig_ref is None:
                     orig_ref = self.get_packed_refs().get(name)
-                    if orig_ref is None:
-                        orig_ref = ZERO_SHA
-                if orig_ref != old_ref:
+                if not _ref_value_matches(orig_ref, old_ref):
                     return False
 
             # remove the reference file itself

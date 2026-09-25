@@ -5608,6 +5608,7 @@ def pack_objects(
       pack_index_version: Pack index version to use (1, 2, or 3). If None, uses default version.
     """
     with open_repo_closing(repo) as r:
+        object_format = r.object_format
         entries, data_sum = write_pack_from_container(
             packf.write,
             r.object_store,
@@ -5615,11 +5616,17 @@ def pack_objects(
             deltify=deltify,
             delta_window_size=delta_window_size,
             reuse_deltas=reuse_deltas,
-            object_format=r.object_format,
+            object_format=object_format,
         )
     if idxf is not None:
         index_entries = sorted([(k, v[0], v[1]) for (k, v) in entries.items()])
-        write_pack_index(idxf, index_entries, data_sum, version=pack_index_version)
+        write_pack_index(
+            idxf,
+            index_entries,
+            data_sum,
+            version=pack_index_version,
+            object_format=object_format,
+        )
 
 
 def ls_tree(

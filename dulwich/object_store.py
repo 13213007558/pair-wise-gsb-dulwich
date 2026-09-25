@@ -804,6 +804,7 @@ class BaseObjectStore:
             [(self[oid], path) for oid, path in object_ids],
             ofs_delta=ofs_delta,
             progress=progress,
+            object_format=self.object_format,
         )
 
     def peel_sha(self, sha: ObjectID | RawObjectID) -> ObjectID:
@@ -1169,6 +1170,7 @@ class PackBasedObjectStore(PackCapableObjectStore, PackedObjectContainer):
             progress=progress,
             ofs_delta=ofs_delta,
             other_haves=remote_has,
+            object_format=self.object_format,
         )
 
     def _clear_cached_packs(self) -> None:
@@ -1574,7 +1576,7 @@ class PackBasedObjectStore(PackCapableObjectStore, PackedObjectContainer):
             try:
                 for o in p.iterobjects_subset(todo, allow_missing=True):
                     yield o
-                    todo.remove(o.id)
+                    todo.remove(ObjectID(o.get_id(self.object_format)))
             except PackFileDisappeared as exc:
                 self._evict_pack(exc.obj)
         # Maybe something else has added a pack with the object
@@ -1583,13 +1585,13 @@ class PackBasedObjectStore(PackCapableObjectStore, PackedObjectContainer):
             try:
                 for o in p.iterobjects_subset(todo, allow_missing=True):
                     yield o
-                    todo.remove(o.id)
+                    todo.remove(ObjectID(o.get_id(self.object_format)))
             except PackFileDisappeared as exc:
                 self._evict_pack(exc.obj)
         for alternate in self.alternates:
             for o in alternate.iterobjects_subset(todo, allow_missing=True):
                 yield o
-                todo.remove(o.id)
+                todo.remove(ObjectID(o.get_id(self.object_format)))
         for oid in todo:
             loose_obj: ShaFile | None = self._get_loose_object(oid)
             if loose_obj is not None:
@@ -1644,7 +1646,10 @@ class PackBasedObjectStore(PackCapableObjectStore, PackedObjectContainer):
         Returns: Pack object of the objects written.
         """
         count = len(objects)
-        record_iter = (full_unpacked_object(o) for (o, p) in objects)
+        record_iter = (
+            full_unpacked_object(o, object_format=self.object_format)
+            for (o, p) in objects
+        )
         return self.add_pack_data(count, record_iter, progress=progress)
 
 
@@ -2273,7 +2278,11 @@ class DiskObjectStore(PackBasedObjectStore):
             shared_perm=self.shared_perm,
         ) as index_file:
             write_pack_index(
-                index_file, entries, pack_sha, version=self.pack_index_version
+                index_file,
+                entries,
+                pack_sha,
+                version=self.pack_index_version,
+                object_format=self.object_format,
             )
 
         # Generate bitmap if configured and refs are available
@@ -3815,7 +3824,13 @@ class BucketBasedObjectStore(PackBasedObjectStore):
                 max_size=PACK_SPOOL_FILE_MAX_SIZE, prefix="incoming-"
             )
             checksum = p.get_stored_checksum()
-            write_pack_index(idxf, entries, checksum, version=self.pack_index_version)
+            write_pack_index(
+                idxf,
+                entries,
+                checksum,
+                version=self.pack_index_version,
+                object_format=self.object_format,
+            )
             idxf.seek(0)
             idx = load_pack_index_file(basename + ".idx", idxf, self.object_format)
             for pack in self.packs:

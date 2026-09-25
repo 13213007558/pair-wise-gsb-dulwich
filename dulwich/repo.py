@@ -839,7 +839,11 @@ class BaseRepo:
         remote_has = missing_objects.get_remote_has()
         object_ids = list(missing_objects)
         return len(object_ids), generate_unpacked_objects(
-            self.object_store, object_ids, progress=progress, other_haves=remote_has
+            self.object_store,
+            object_ids,
+            progress=progress,
+            other_haves=remote_has,
+            object_format=self.object_format,
         )
 
     def find_missing_objects(

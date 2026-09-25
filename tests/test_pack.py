@@ -36,7 +36,7 @@ from typing import NoReturn
 
 from dulwich.errors import ApplyDeltaError, ChecksumMismatch
 from dulwich.file import GitFile
-from dulwich.object_format import DEFAULT_OBJECT_FORMAT
+from dulwich.object_format import DEFAULT_OBJECT_FORMAT, SHA256
 from dulwich.object_store import MemoryObjectStore
 from dulwich.objects import Blob, Commit, Tree, hex_to_sha, sha_to_hex
 from dulwich.pack import (
@@ -1416,14 +1416,26 @@ class TestPackIndexWritingv3(TestCase, BaseTestFilePackIndexWriting):
 
     def test_v3_sha256_length(self) -> None:
         """Test v3 index with SHA-256 hash length."""
-        # For now, test that SHA-256 is not yet implemented
         entries = [(b"a" * 32, 42, zlib.crc32(b"data"))]
         filename = os.path.join(self.tempdir, "test_sha256.idx")
-        # SHA-256 should raise NotImplementedError
-        with self.assertRaises(NotImplementedError) as cm:
+        with GitFile(filename, "wb") as f:
+            write_pack_index_v3(f, entries, b"1" * 32, hash_format=2)
+        idx = load_pack_index(filename, SHA256)
+        self.addCleanup(idx.close)
+        self.assertIsInstance(idx, PackIndex3)
+        self.assertEqual(idx.version, 3)
+        self.assertEqual(idx.hash_format, 2)  # SHA-256
+        self.assertEqual(idx.hash_size, 32)
+        self.assertEqual(list(idx.iterentries()), entries)
+
+    def test_v3_sha256_wrong_checksum_length(self) -> None:
+        """Test v3 index with SHA-256 rejects SHA-1 pack checksum."""
+        entries = [(b"a" * 32, 42, zlib.crc32(b"data"))]
+        filename = os.path.join(self.tempdir, "test_sha256_bad.idx")
+        with self.assertRaises(ValueError) as cm:
             with GitFile(filename, "wb") as f:
-                write_pack_index_v3(f, entries, b"1" * 32, hash_format=2)
-        self.assertIn("SHA-256", str(cm.exception))
+                write_pack_index_v3(f, entries, b"1" * 20, hash_format=2)
+        self.assertIn("wrong length", str(cm.exception))
 
     def test_v3_invalid_hash_algorithm(self) -> None:
         """Test v3 index with invalid hash algorithm."""

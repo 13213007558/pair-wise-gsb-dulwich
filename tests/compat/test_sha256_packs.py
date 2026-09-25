@@ -22,14 +22,25 @@
 """Compatibility tests for SHA256 pack files with git command line tools."""
 
 import os
+import sys
 import tempfile
 
+import dulwich
 from dulwich.object_format import SHA256
+from dulwich.object_store import MissingObjectFinder
 from dulwich.objects import Blob, Commit, Tree
-from dulwich.pack import load_pack_index_file
+from dulwich.pack import (
+    load_pack_index_file,
+    write_pack_from_container,
+    write_pack_index,
+)
 from dulwich.repo import Repo
 
 from .utils import CompatTestCase, rmtree_ro, run_git_or_fail
+
+# Root of the dulwich source tree, so that git's ext:: transport can run
+# "python -m dulwich ..." against this checkout.
+_DULWICH_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(dulwich.__file__)))
 
 
 class GitSHA256PackCompatibilityTests(CompatTestCase):
@@ -277,6 +288,227 @@ class GitSHA256PackCompatibilityTests(CompatTestCase):
 
         self.assertEqual(commit_count, 1)  # We made 2 commits total
         repo.close()
+
+
+class GitSHA256PackWriteCompatibilityTests(CompatTestCase):
+    """Test that dulwich-written SHA256 packs and indexes are accepted by git."""
+
+    min_git_version = (2, 29, 0)
+
+    def _run_git(self, args, cwd=None, env=None, **kwargs):
+        """Run git command in the specified directory."""
+        return run_git_or_fail(args, cwd=cwd, env=env or {}, **kwargs)
+
+    def _make_git_repo(self):
+        """Create a git SHA-256 repo with several commits and packed objects."""
+        repo_path = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, repo_path)
+        self._run_git(["init", "-b", "main", "--object-format=sha256", repo_path])
+        big = "x" * 2000
+        for i in range(5):
+            with open(os.path.join(repo_path, "big.txt"), "w") as f:
+                f.write(big + f" variation {i}\n")
+            with open(os.path.join(repo_path, f"file{i}.txt"), "w") as f:
+                f.write(f"content {i}\n")
+            self._run_git(["add", "."], cwd=repo_path)
+            self._run_git(["commit", "-m", f"commit {i}"], cwd=repo_path)
+        # Pack everything so that delta reuse is exercised
+        self._run_git(["gc", "--aggressive"], cwd=repo_path)
+        return repo_path
+
+    def _write_pack(self, repo, object_ids, pack_path, idx_path, **kwargs):
+        """Write a pack and its index with dulwich."""
+        with open(pack_path, "wb") as f:
+            entries, pack_checksum = write_pack_from_container(
+                f.write,
+                repo.object_store,
+                object_ids,
+                object_format=SHA256,
+                **kwargs,
+            )
+        index_entries = sorted((k, v[0], v[1]) for k, v in entries.items())
+        with open(idx_path, "wb") as f:
+            write_pack_index(f, index_entries, pack_checksum, object_format=SHA256)
+        return pack_checksum
+
+    def _all_object_ids(self, repo):
+        head = repo.refs[b"refs/heads/main"]
+        mof = MissingObjectFinder(repo.object_store, haves=set(), wants=[head])
+        return list(mof)
+
+    def test_dulwich_pack_passes_git_index_pack_strict(self):
+        """git index-pack --strict verifies a dulwich-written SHA256 pack."""
+        src_path = self._make_git_repo()
+        repo = Repo(src_path)
+        self.addCleanup(repo.close)
+
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, out_dir)
+        pack_path = os.path.join(out_dir, "dulwich.pack")
+        idx_path = os.path.join(out_dir, "dulwich.idx")
+        # deltify exercises OFS_DELTA/REF_DELTA encoding
+        self._write_pack(
+            repo, self._all_object_ids(repo), pack_path, idx_path, deltify=True
+        )
+
+        # git verifies the pack and writes its own index next to a copy.
+        # GIT_CEILING_DIRECTORIES keeps git from discovering an enclosing
+        # repository, so index-pack runs in standalone mode.
+        git_idx_path = os.path.join(out_dir, "git.idx")
+        self._run_git(
+            [
+                "index-pack",
+                "--strict",
+                "--object-format=sha256",
+                "-o",
+                git_idx_path,
+                pack_path,
+            ],
+            cwd=out_dir,
+            env={"GIT_CEILING_DIRECTORIES": out_dir},
+        )
+        # The index dulwich wrote is byte-identical to the one git writes
+        with open(idx_path, "rb") as f:
+            dulwich_idx = f.read()
+        with open(git_idx_path, "rb") as f:
+            git_idx = f.read()
+        self.assertEqual(git_idx, dulwich_idx)
+
+    def test_dulwich_pack_and_index_pass_git_fsck(self):
+        """git fsck accepts a repo whose pack and index were written by dulwich."""
+        src_path = self._make_git_repo()
+        repo = Repo(src_path)
+        self.addCleanup(repo.close)
+        head = repo.refs[b"refs/heads/main"]
+
+        # Fresh git repo; the only objects it has come from the dulwich pack
+        dst_path = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, dst_path)
+        self._run_git(["init", "-b", "main", "--object-format=sha256", dst_path])
+        pack_dir = os.path.join(dst_path, ".git", "objects", "pack")
+        object_ids = self._all_object_ids(repo)
+        pack_base = os.path.join(pack_dir, "pack-dulwich")
+        self._write_pack(repo, object_ids, pack_base + ".pack", pack_base + ".idx")
+
+        self._run_git(
+            ["update-ref", "refs/heads/main", head.decode("ascii")], cwd=dst_path
+        )
+        self._run_git(["fsck", "--strict"], cwd=dst_path)
+        # git can check out the content from the dulwich-written pack
+        self._run_git(["checkout", "-f", "main"], cwd=dst_path)
+        with open(os.path.join(dst_path, "file4.txt"), "rb") as f:
+            self.assertEqual(b"content 4\n", f.read())
+
+    def test_dulwich_thin_pack_completed_by_git(self):
+        """git index-pack --fix-thin completes a dulwich-written thin pack."""
+        src_path = self._make_git_repo()
+        repo = Repo(src_path)
+        self.addCleanup(repo.close)
+
+        head = repo.refs[b"refs/heads/main"]
+        first_commit = head
+        while repo[first_commit].parents:
+            first_commit = repo[first_commit].parents[0]
+        # Send everything but the first commit's objects, which the
+        # receiving side already has
+        mof = MissingObjectFinder(repo.object_store, haves={first_commit}, wants=[head])
+        object_ids = list(mof)
+        remote_has = mof.get_remote_has()
+
+        out_dir = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, out_dir)
+        thin_pack_path = os.path.join(out_dir, "thin.pack")
+        with open(thin_pack_path, "wb") as f:
+            write_pack_from_container(
+                f.write,
+                repo.object_store,
+                object_ids,
+                object_format=SHA256,
+                other_haves=remote_has,
+            )
+
+        with open(thin_pack_path, "rb") as f:
+            thin_pack = f.read()
+        # git completes the thin pack against the objects in the source repo
+        self._run_git(
+            ["index-pack", "--strict", "--fix-thin", "--stdin"],
+            cwd=src_path,
+            input=thin_pack,
+        )
+
+    def test_bidirectional_exchange_with_git_client(self):
+        """git client clones, fetches and pushes against dulwich servers."""
+        src_path = self._make_git_repo()
+        env = {"PYTHONPATH": _DULWICH_PARENT}
+        upload_pack = f"ext::{sys.executable} -m dulwich upload-pack {src_path}"
+
+        # Clone from dulwich upload-pack; git verifies the pack with
+        # index-pack as it receives it
+        work_dir = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, work_dir)
+        clone_path = os.path.join(work_dir, "clone")
+        self._run_git(
+            ["-c", "protocol.ext.allow=always", "clone", upload_pack, clone_path],
+            cwd=work_dir,
+            env=env,
+        )
+        output = self._run_git(["rev-parse", "--show-object-format"], cwd=clone_path)
+        self.assertEqual(b"sha256", output.strip())
+        self._run_git(["fsck", "--strict"], cwd=clone_path)
+
+        # Incremental fetch: the dulwich server sends a thin pack against
+        # the objects the clone already has
+        with open(os.path.join(src_path, "big.txt"), "a") as f:
+            f.write("more data\n")
+        self._run_git(["add", "."], cwd=src_path)
+        self._run_git(["commit", "-m", "another commit"], cwd=src_path)
+        self._run_git(
+            ["-c", "protocol.ext.allow=always", "fetch", "origin"],
+            cwd=clone_path,
+            env=env,
+        )
+        self._run_git(["merge", "--ff-only", "origin/main"], cwd=clone_path)
+        self._run_git(["fsck", "--strict"], cwd=clone_path)
+
+        # Push to a bare repository served by dulwich receive-pack
+        bare_path = tempfile.mkdtemp()
+        self.addCleanup(rmtree_ro, bare_path)
+        self._run_git(
+            ["init", "--bare", "-b", "main", "--object-format=sha256", bare_path]
+        )
+        receive_pack_url = f"ext::{sys.executable} -m dulwich receive-pack {bare_path}"
+        with open(os.path.join(clone_path, "pushed.txt"), "w") as f:
+            f.write("pushed from git\n")
+        self._run_git(["add", "."], cwd=clone_path)
+        self._run_git(["commit", "-m", "pushed commit"], cwd=clone_path)
+        self._run_git(
+            ["-c", "protocol.ext.allow=always", "push", receive_pack_url, "main:main"],
+            cwd=clone_path,
+            env=env,
+        )
+
+        # The ref was updated and git fsck is happy with the pack and
+        # index dulwich wrote while receiving the push
+        pushed_head = self._run_git(["rev-parse", "main"], cwd=clone_path).strip()
+        refs = self._run_git(["show-ref"], cwd=bare_path)
+        self.assertIn(pushed_head + b" refs/heads/main", refs)
+        self._run_git(["fsck", "--strict"], cwd=bare_path)
+
+        # git index-pack --strict verifies the pack dulwich stored
+        pack_dir = os.path.join(bare_path, "objects", "pack")
+        pack_files = [f for f in os.listdir(pack_dir) if f.endswith(".pack")]
+        self.assertEqual(1, len(pack_files))
+        self._run_git(
+            [
+                "index-pack",
+                "--strict",
+                "--object-format=sha256",
+                "-o",
+                os.path.join(pack_dir, "verify.idx"),
+                os.path.join(pack_dir, pack_files[0]),
+            ],
+            cwd=bare_path,
+        )
 
 
 if __name__ == "__main__":
