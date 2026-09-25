@@ -40,6 +40,7 @@ __all__ = [
     "CHUNK_OID_LOOKUP",
     "COMMIT_GRAPH_SIGNATURE",
     "COMMIT_GRAPH_VERSION",
+    "GENERATION_DATA_OVERFLOW_FLAG",
     "GENERATION_NUMBER_INFINITY",
     "GENERATION_NUMBER_V1_MAX",
     "GENERATION_NUMBER_ZERO",
@@ -50,15 +51,19 @@ __all__ = [
     "HASH_VERSION_SHA1",
     "HASH_VERSION_SHA256",
     "CommitGraph",
+    "CommitGraphChain",
     "CommitGraphChunk",
     "CommitGraphEntry",
     "find_commit_graph_file",
     "generate_commit_graph",
     "get_reachable_commits",
     "read_commit_graph",
+    "read_commit_graph_chain",
     "write_commit_graph",
 ]
 
+import hashlib
+import io
 import os
 import struct
 from collections.abc import Iterator, Sequence
@@ -90,6 +95,7 @@ CHUNK_BLOOM_FILTER_DATA = b"BDAT"
 CHUNK_BASE_GRAPHS_LIST = b"BASE"
 
 # Generation number constants
+GENERATION_DATA_OVERFLOW_FLAG = 0x80000000
 GENERATION_NUMBER_INFINITY = 0xFFFFFFFF
 GENERATION_NUMBER_ZERO = 0
 GENERATION_NUMBER_V1_MAX = 0x3FFFFFFF
@@ -111,6 +117,7 @@ class CommitGraphEntry:
         parents: list[ObjectID],
         generation: int,
         commit_time: int,
+        generation_v2: int | None = None,
     ) -> None:
         """Initialize CommitGraphEntry.
 
@@ -120,12 +127,15 @@ class CommitGraphEntry:
           parents: List of parent commit IDs
           generation: Generation number
           commit_time: Commit timestamp
+          generation_v2: Corrected commit date (generation data v2), if
+            the graph contained a generation data chunk
         """
         self.commit_id = commit_id
         self.tree_id = tree_id
         self.parents = parents
         self.generation = generation
         self.commit_time = commit_time
+        self.generation_v2 = generation_v2
 
     def __repr__(self) -> str:
         """Return string representation of CommitGraphEntry."""
@@ -181,6 +191,7 @@ class CommitGraph:
         self.chunks: dict[bytes, CommitGraphChunk] = {}
         self.entries: list[CommitGraphEntry] = []
         self._oid_to_index: dict[RawObjectID, int] = {}
+        self.num_base_graphs = 0
 
     @classmethod
     def from_file(cls, f: BinaryIO) -> "CommitGraph":
@@ -188,8 +199,18 @@ class CommitGraph:
         return cls._read_from_file(f)
 
     @classmethod
-    def _read_from_file(cls, f: BinaryIO) -> "CommitGraph":
-        """Read commit graph data from file."""
+    def _read_from_file(
+        cls, f: BinaryIO, base_oids: Sequence[RawObjectID] = ()
+    ) -> "CommitGraph":
+        """Read commit graph data from file.
+
+        Args:
+          f: File-like object to read the graph from
+          base_oids: Commit IDs of the base layers this graph builds on, in
+            chain order. Parent positions in an incremental (split) graph
+            index into the concatenation of the base layers' commit IDs and
+            this graph's own commit IDs.
+        """
         # Read header
         signature = f.read(4)
         if signature != COMMIT_GRAPH_SIGNATURE:
@@ -216,7 +237,7 @@ class CommitGraph:
         graph.hash_version = hash_version
 
         num_chunks = struct.unpack(">B", f.read(1))[0]
-        struct.unpack(">B", f.read(1))[0]
+        graph.num_base_graphs = struct.unpack(">B", f.read(1))[0]
 
         # Read table of contents
         toc_entries = []
@@ -237,12 +258,18 @@ class CommitGraph:
             graph.chunks[chunk_id] = CommitGraphChunk(chunk_id, chunk_data)
 
         # Parse chunks
-        graph._parse_chunks()
+        graph._parse_chunks(base_oids)
 
         return graph
 
-    def _parse_chunks(self) -> None:
-        """Parse chunk data into entries."""
+    def _parse_chunks(self, base_oids: Sequence[RawObjectID] = ()) -> None:
+        """Parse chunk data into entries.
+
+        Args:
+          base_oids: Commit IDs of the base layers of a split commit graph,
+            in chain order. Parent positions stored in this graph index into
+            the concatenation of base_oids and this graph's own commit IDs.
+        """
         if CHUNK_OID_LOOKUP not in self.chunks:
             raise ValueError("Missing required OID lookup chunk")
         if CHUNK_COMMIT_DATA not in self.chunks:
@@ -259,6 +286,13 @@ class CommitGraph:
             oid = RawObjectID(oid_lookup_data[start:end])
             oids.append(oid)
             self._oid_to_index[oid] = i
+
+        # Parent positions in an incremental graph index into the
+        # concatenation of the base layers' commits and this graph's commits.
+        if base_oids:
+            position_oids: Sequence[RawObjectID] = list(base_oids) + oids
+        else:
+            position_oids = oids
 
         # Parse commit data chunk
         commit_data = self.chunks[CHUNK_COMMIT_DATA].data
@@ -292,18 +326,18 @@ class CommitGraph:
             # Parse parents
             parents = []
             if parent1_pos < GRAPH_PARENT_MISSING:
-                if parent1_pos >= len(oids):
+                if parent1_pos >= len(position_oids):
                     raise ValueError(f"Invalid parent1 position: {parent1_pos}")
-                parents.append(oids[parent1_pos])
+                parents.append(position_oids[parent1_pos])
 
             if parent2_pos < GRAPH_PARENT_MISSING:
-                if parent2_pos >= len(oids):
+                if parent2_pos >= len(position_oids):
                     raise ValueError(f"Invalid parent2 position: {parent2_pos}")
-                parents.append(oids[parent2_pos])
+                parents.append(position_oids[parent2_pos])
             elif parent2_pos >= GRAPH_EXTRA_EDGES_NEEDED:
                 # Handle extra edges (3+ parents)
                 edge_index = parent2_pos & ~GRAPH_EXTRA_EDGES_NEEDED
-                parents.extend(self._parse_extra_edges(edge_index, oids))
+                parents.extend(self._parse_extra_edges(edge_index, position_oids))
 
             entry = CommitGraphEntry(
                 commit_id=sha_to_hex(oids[i]),
@@ -313,6 +347,37 @@ class CommitGraph:
                 commit_time=commit_time,
             )
             self.entries.append(entry)
+
+        # Parse generation data chunk (corrected commit dates) if present
+        if CHUNK_GENERATION_DATA in self.chunks:
+            self._parse_generation_data(num_commits)
+
+    def _parse_generation_data(self, num_commits: int) -> None:
+        """Parse the GDA2/GDO2 chunks into per-entry corrected commit dates."""
+        gen_data = self.chunks[CHUNK_GENERATION_DATA].data
+        if len(gen_data) != num_commits * 4:
+            raise ValueError(
+                f"Invalid generation data chunk size: {len(gen_data)}, "
+                f"expected {num_commits * 4}"
+            )
+
+        overflow_data = b""
+        if CHUNK_GENERATION_DATA_OVERFLOW in self.chunks:
+            overflow_data = self.chunks[CHUNK_GENERATION_DATA_OVERFLOW].data
+
+        for i, entry in enumerate(self.entries):
+            offset = struct.unpack(">L", gen_data[i * 4 : i * 4 + 4])[0]
+            if offset & GENERATION_DATA_OVERFLOW_FLAG:
+                overflow_index = offset & ~GENERATION_DATA_OVERFLOW_FLAG
+                overflow_offset = overflow_index * 8
+                if overflow_offset + 8 > len(overflow_data):
+                    raise ValueError(
+                        f"Invalid generation data overflow index: {overflow_index}"
+                    )
+                offset = struct.unpack(
+                    ">Q", overflow_data[overflow_offset : overflow_offset + 8]
+                )[0]
+            entry.generation_v2 = entry.commit_time + offset
 
     def _parse_extra_edges(
         self, index: int, oids: Sequence[RawObjectID]
@@ -479,6 +544,168 @@ def read_commit_graph(path: str | bytes) -> CommitGraph | None:
 
     with open(path, "rb") as f:
         return CommitGraph.from_file(f)
+
+
+def _verify_graph_checksum(raw: bytes) -> None:
+    """Verify the trailing checksum of a serialized commit graph file.
+
+    Args:
+      raw: Full contents of the commit graph file, including the trailing
+        checksum.
+
+    Raises:
+      ValueError: If the file is truncated or the checksum does not match.
+    """
+    if len(raw) < 8:
+        raise ValueError("Commit graph file too short")
+    hash_version = raw[5]
+    if hash_version == HASH_VERSION_SHA1:
+        hash_name = "sha1"
+    elif hash_version == HASH_VERSION_SHA256:
+        hash_name = "sha256"
+    else:
+        raise ValueError(f"Unsupported hash version: {hash_version}")
+    digest_size = hashlib.new(hash_name).digest_size
+    if len(raw) < digest_size:
+        raise ValueError("Commit graph file too short for checksum")
+    expected = hashlib.new(hash_name, raw[:-digest_size]).digest()
+    if expected != raw[-digest_size:]:
+        raise ValueError("Commit graph checksum mismatch")
+
+
+class CommitGraphChain(CommitGraph):
+    """A chain of incremental (split) commit graph files.
+
+    Git's split commit-graph feature stores commit metadata in a stack of
+    graph files listed in objects/info/commit-graphs/commit-graph-chain.
+    Each incremental layer only contains new commits; parent positions in a
+    layer index into the concatenation of all commits from the base layers
+    up to and including that layer.
+
+    This class assembles the layers listed in a chain file and presents the
+    same interface as a single CommitGraph.
+    """
+
+    def __init__(self, layers: list[CommitGraph]) -> None:
+        """Initialize CommitGraphChain.
+
+        Args:
+          layers: Graph layers ordered from base to tip, as listed in the
+            commit-graph-chain file.
+        """
+        if not layers:
+            raise ValueError("Commit graph chain requires at least one layer")
+        super().__init__(object_format=layers[-1].object_format)
+        self.layers = layers
+        # Merge the per-layer entries into a single view. Layers are
+        # disjoint in practice, but let later (tip) layers win lookups to
+        # match C Git, which searches the tip layer first.
+        self.entries = []
+        self._oid_to_index = {}
+        for layer in layers:
+            for entry in layer.entries:
+                self._oid_to_index[hex_to_sha(entry.commit_id)] = len(self.entries)
+                self.entries.append(entry)
+
+
+def read_commit_graph_chain(path: str | bytes) -> CommitGraphChain | None:
+    """Read a split commit graph chain from a commit-graph-chain file.
+
+    Args:
+      path: Path to the commit-graph-chain file (usually
+        objects/info/commit-graphs/commit-graph-chain).
+
+    Returns:
+      CommitGraphChain if a consistent chain was found, None if there is no
+      chain or the chain disappeared while being read (e.g. replaced by a
+      concurrent maintenance run). Callers should fall back to reading
+      commit objects directly in that case.
+
+    Raises:
+      ValueError: If the chain or one of its layers is corrupt (bad
+        checksum, missing base graph list, inconsistent layers).
+    """
+    if isinstance(path, str):
+        path = path.encode()
+
+    try:
+        with open(path, "rb") as f:
+            chain_data = f.read()
+    except FileNotFoundError:
+        return None
+
+    hashes = chain_data.split()
+    if not hashes:
+        return None
+
+    chain_dir = os.path.dirname(path)
+    layers: list[CommitGraph] = []
+    base_oids: list[RawObjectID] = []
+    for index, layer_hash in enumerate(hashes):
+        layer_path = os.path.join(chain_dir, b"graph-" + layer_hash + b".graph")
+        try:
+            with open(layer_path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            # A layer listed in the chain file is missing, most likely
+            # because a concurrent maintenance process replaced the chain.
+            # Fall back to object traversal rather than returning an
+            # incomplete view of the history.
+            return None
+
+        _verify_graph_checksum(raw)
+        layer = CommitGraph._read_from_file(io.BytesIO(raw), base_oids)
+
+        if layer.object_format.hex_length != len(layer_hash):
+            raise ValueError(
+                f"Chain entry {layer_hash!r} does not match graph hash version"
+            )
+        if layer.num_base_graphs != index:
+            raise ValueError(
+                f"Graph layer {layer_hash!r} expects {layer.num_base_graphs} "
+                f"base graphs, found at position {index} in chain"
+            )
+
+        base_chunk = layer.chunks.get(CHUNK_BASE_GRAPHS_LIST)
+        if index == 0:
+            if base_chunk is not None:
+                raise ValueError("Base graph layer has a base graphs chunk")
+        else:
+            if base_chunk is None:
+                raise ValueError(
+                    f"Graph layer {layer_hash!r} is missing its base graphs chunk"
+                )
+            base_data = base_chunk.data
+            oid_length = layer.object_format.oid_length
+            if len(base_data) != index * oid_length:
+                raise ValueError(
+                    f"Graph layer {layer_hash!r} has invalid base graphs chunk"
+                )
+            for base_index in range(index):
+                start = base_index * oid_length
+                expected = sha_to_hex(
+                    RawObjectID(base_data[start : start + oid_length])
+                )
+                if expected != hashes[base_index]:
+                    raise ValueError(
+                        f"Graph layer {layer_hash!r} does not match the "
+                        "commit-graph-chain file"
+                    )
+
+        layers.append(layer)
+        base_oids.extend(hex_to_sha(entry.commit_id) for entry in layer.entries)
+
+    # The chain file may have been replaced by a concurrent maintenance
+    # process while the layers were being read. Re-read it and fall back to
+    # object traversal if it no longer matches what was assembled.
+    try:
+        with open(path, "rb") as f:
+            if f.read() != chain_data:
+                return None
+    except FileNotFoundError:
+        return None
+
+    return CommitGraphChain(layers)
 
 
 def find_commit_graph_file(git_dir: str | bytes) -> bytes | None:

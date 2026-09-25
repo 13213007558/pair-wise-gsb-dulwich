@@ -40,18 +40,26 @@ from dulwich.commit_graph import (
     GRAPH_PARENT_MISSING,
     HASH_VERSION_SHA1,
     CommitGraph,
+    CommitGraphChain,
     CommitGraphChunk,
     CommitGraphEntry,
     find_commit_graph_file,
     generate_commit_graph,
     get_reachable_commits,
     read_commit_graph,
+    read_commit_graph_chain,
 )
 from dulwich.graph import can_fast_forward, find_merge_base
 from dulwich.object_format import SHA1
-from dulwich.object_store import DiskObjectStore, MemoryObjectStore
+from dulwich.object_store import (
+    DiskObjectStore,
+    MemoryObjectStore,
+    find_shallow,
+    get_depth,
+)
 from dulwich.objects import Commit, Tree, hex_to_sha, sha_to_hex
 from dulwich.repo import ParentsProvider, Repo
+from dulwich.tests.utils import open_repo, tear_down_repo
 
 
 class CommitGraphEntryTests(unittest.TestCase):
@@ -1042,6 +1050,222 @@ class CommitGraphGenerationTests(unittest.TestCase):
         self.assertEqual(
             result_with_graph, [commits[0].id], "Merge base should be the first commit"
         )
+
+
+class CommitGraphChainTests(unittest.TestCase):
+    """Tests for CommitGraphChain."""
+
+    def test_init_requires_layers(self) -> None:
+        with self.assertRaises(ValueError):
+            CommitGraphChain([])
+
+    def test_read_missing_chain_file(self) -> None:
+        tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tempdir, True)
+        result = read_commit_graph_chain(os.path.join(tempdir, "commit-graph-chain"))
+        self.assertIsNone(result)
+
+
+class SplitCommitGraphChainTests(unittest.TestCase):
+    """Tests for reading split (incremental) commit graph chains.
+
+    These tests use testdata/repos/split_commit_graph.git, a repository
+    whose commit graph was written by C Git as three incremental layers
+    (git commit-graph write --split=no-merge). The history includes merges
+    whose parents live in lower layers and an octopus merge recorded in the
+    tip layer's extra edge list.
+    """
+
+    def setUp(self) -> None:
+        self.repo = open_repo("split_commit_graph.git")
+        self.addCleanup(tear_down_repo, self.repo)
+        self.store = self.repo.object_store
+
+    def _commits(self) -> dict[bytes, Commit]:
+        commits = {}
+        for sha in self.store:
+            obj = self.store[sha]
+            if isinstance(obj, Commit):
+                commits[sha] = obj
+        return commits
+
+    def _chain(self) -> CommitGraphChain:
+        graph = self.store.get_commit_graph()
+        self.assertIsInstance(graph, CommitGraphChain)
+        assert isinstance(graph, CommitGraphChain)
+        return graph
+
+    def test_chain_is_loaded(self) -> None:
+        chain = self._chain()
+        self.assertEqual(3, len(chain.layers))
+        self.assertEqual(10, len(chain))
+
+    def test_parents_match_commit_objects(self) -> None:
+        chain = self._chain()
+        commits = self._commits()
+        self.assertEqual(10, len(commits))
+        for sha, commit in commits.items():
+            self.assertEqual(
+                list(commit.parents),
+                chain.get_parents(sha),
+                f"parents mismatch for {sha!r}",
+            )
+
+    def test_octopus_merge_parents(self) -> None:
+        chain = self._chain()
+        octopus = [c for c in self._commits().values() if len(c.parents) == 3]
+        self.assertEqual(1, len(octopus))
+        self.assertEqual(list(octopus[0].parents), chain.get_parents(octopus[0].id))
+
+    def test_cross_layer_parents(self) -> None:
+        chain = self._chain()
+        layer_ids = [
+            {entry.commit_id for entry in layer.entries} for layer in chain.layers
+        ]
+        # The middle layer contains commits whose parents only exist in the
+        # base layer.
+        self.assertTrue(
+            any(
+                parent in layer_ids[0]
+                for entry in chain.layers[1].entries
+                for parent in entry.parents
+            )
+        )
+        # The octopus merge in the tip layer has parents in the middle layer.
+        tip_octopus = [
+            entry for entry in chain.layers[2].entries if len(entry.parents) == 3
+        ]
+        self.assertEqual(1, len(tip_octopus))
+        self.assertTrue(
+            any(parent in layer_ids[1] for parent in tip_octopus[0].parents)
+        )
+
+    def test_generation_data(self) -> None:
+        chain = self._chain()
+        for entry in chain:
+            self.assertIsNotNone(entry.generation_v2)
+            # The fixture uses strictly increasing commit timestamps, so the
+            # corrected commit date equals the commit time.
+            self.assertEqual(entry.commit_time, entry.generation_v2)
+            self.assertGreaterEqual(entry.generation, 1)
+        # Generation numbers must exceed those of the parents.
+        by_id = {entry.commit_id: entry for entry in chain}
+        for entry in chain:
+            for parent in entry.parents:
+                self.assertLess(
+                    by_id[parent].generation,
+                    entry.generation,
+                    f"generation order violated at {entry.commit_id!r}",
+                )
+
+    def test_parents_provider_matches_object_fallback(self) -> None:
+        commits = self._commits()
+        with_graph = ParentsProvider(self.store)
+        self.assertIsNotNone(with_graph.commit_graph)
+        without_graph = ParentsProvider(self.store)
+        without_graph.commit_graph = None
+        for sha, commit in commits.items():
+            self.assertEqual(list(commit.parents), with_graph.get_parents(sha))
+            self.assertEqual(list(commit.parents), without_graph.get_parents(sha))
+
+    def test_ancestor_walk_matches_object_traversal(self) -> None:
+        head = self.repo.refs[b"refs/heads/main"]
+        plain_store = DiskObjectStore(self.store.path)
+        self.addCleanup(plain_store.close)
+        plain_store._use_commit_graph = False
+
+        self.assertEqual(get_depth(plain_store, head), get_depth(self.store, head))
+        for depth in (1, 2, 3):
+            self.assertEqual(
+                find_shallow(plain_store, [head], depth),
+                find_shallow(self.store, [head], depth),
+            )
+
+    def test_reading_does_not_rewrite_graph(self) -> None:
+        info_dir = os.path.join(self.store.path, "info")
+
+        def snapshot() -> dict[str, bytes]:
+            result = {}
+            for root, _dirs, files in os.walk(info_dir):
+                for name in files:
+                    path = os.path.join(root, name)
+                    with open(path, "rb") as f:
+                        result[os.path.relpath(path, info_dir)] = f.read()
+            return result
+
+        before = snapshot()
+        chain = self._chain()
+        head = self.repo.refs[b"refs/heads/main"]
+        chain.get_parents(head)
+        get_depth(self.store, head)
+        find_shallow(self.store, [head], 2)
+        ParentsProvider(self.store).get_parents(head)
+        self.assertEqual(before, snapshot())
+        # In particular, the chain must not be collapsed into a single file.
+        self.assertFalse(os.path.exists(os.path.join(info_dir, "commit-graph")))
+
+    def test_missing_layer_falls_back_to_objects(self) -> None:
+        commits = self._commits()
+        chain_dir = os.path.join(self.store.path, "info", "commit-graphs")
+        layer_files = sorted(
+            name for name in os.listdir(chain_dir) if name.startswith("graph-")
+        )
+        os.remove(os.path.join(chain_dir, layer_files[0]))
+
+        self.assertIsNone(self.store.get_commit_graph())
+        # Traversal must still produce complete results from commit objects.
+        provider = ParentsProvider(self.store)
+        for sha, commit in commits.items():
+            self.assertEqual(list(commit.parents), provider.get_parents(sha))
+
+    def test_corrupt_layer_checksum_falls_back_to_objects(self) -> None:
+        commits = self._commits()
+        chain_dir = os.path.join(self.store.path, "info", "commit-graphs")
+        layer_files = sorted(
+            name for name in os.listdir(chain_dir) if name.startswith("graph-")
+        )
+        layer_path = os.path.join(chain_dir, layer_files[1])
+        os.chmod(layer_path, 0o644)
+        with open(layer_path, "r+b") as f:
+            data = bytearray(f.read())
+            data[len(data) // 2] ^= 0xFF
+            f.seek(0)
+            f.write(data)
+
+        self.assertIsNone(self.store.get_commit_graph())
+        provider = ParentsProvider(self.store)
+        for sha, commit in commits.items():
+            self.assertEqual(list(commit.parents), provider.get_parents(sha))
+
+    def test_replaced_chain_file_falls_back_to_objects(self) -> None:
+        commits = self._commits()
+        chain_file = os.path.join(
+            self.store.path, "info", "commit-graphs", "commit-graph-chain"
+        )
+        # Simulate a maintenance process replacing the chain with one that
+        # references layers that do not exist (yet).
+        os.chmod(chain_file, 0o644)
+        with open(chain_file, "wb") as f:
+            f.write(b"a" * 40 + b"\n")
+
+        self.assertIsNone(self.store.get_commit_graph())
+        provider = ParentsProvider(self.store)
+        for sha, commit in commits.items():
+            self.assertEqual(list(commit.parents), provider.get_parents(sha))
+
+    def test_reordered_chain_falls_back_to_objects(self) -> None:
+        chain_file = os.path.join(
+            self.store.path, "info", "commit-graphs", "commit-graph-chain"
+        )
+        os.chmod(chain_file, 0o644)
+        with open(chain_file, "rb") as f:
+            layers = f.read().split()
+        self.assertEqual(3, len(layers))
+        with open(chain_file, "wb") as f:
+            f.write(b"\n".join(reversed(layers)) + b"\n")
+
+        # Layer base-graph lists no longer match the chain order.
+        self.assertIsNone(self.store.get_commit_graph())
 
 
 if __name__ == "__main__":

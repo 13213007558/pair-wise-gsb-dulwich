@@ -1,5 +1,12 @@
 1.2.16	UNRELEASED
 
+ * Read split (incremental) commit graph chains. ``get_commit_graph`` now
+   assembles the layers listed in
+   ``objects/info/commit-graphs/commit-graph-chain``, resolving parent
+   positions, extra edges and generation data across layers, and falls back
+   to object traversal when the chain is incomplete, corrupt or replaced by
+   a concurrent maintenance run.
+
  * Fix a crash in ``dulwich log <path>`` on merge commits where the path is
    unchanged relative to one parent. ``tree_changes_for_merge`` reports
    ``None`` for such parents, which the walker and the ``--name-status`` and
