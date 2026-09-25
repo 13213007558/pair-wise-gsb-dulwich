@@ -135,7 +135,7 @@ if TYPE_CHECKING:
     from .commit_graph import CommitGraph
     from .config import Config
     from .diff_tree import RenameDetector
-    from .pack import FilePackIndex, Pack
+    from .pack import FilePackIndex, Pack, ResolveExtRefFn
 
 
 logger = logging.getLogger(__name__)
@@ -2198,6 +2198,7 @@ class DiskObjectStore(PackBasedObjectStore):
         ext_refs: set[RawObjectID],
         progress: Callable[..., None] | None = None,
         refs: dict[Ref, ObjectID] | None = None,
+        resolve_ext_ref: "ResolveExtRefFn | None" = None,
     ) -> Pack:
         """Move a specific file containing a pack into the pack directory.
 
@@ -2217,11 +2218,18 @@ class DiskObjectStore(PackBasedObjectStore):
           ext_refs: Objects the pack deltas against that it does not contain.
           progress: Optional progress reporting function.
           refs: Optional dictionary of refs for bitmap generation.
+          resolve_ext_ref: Optional function to resolve external delta base
+            objects. Defaults to this store's ``get_raw``; callers that
+            complete a thin pack against objects living outside this store
+            (e.g. a quarantine store falling back to the main object store)
+            can pass a lookup that sees those objects.
         """
+        if resolve_ext_ref is None:
+            resolve_ext_ref = self.get_raw
         pack_sha, extra_entries = extend_pack(
             f,
             ext_refs,
-            get_raw=self.get_raw,
+            get_raw=resolve_ext_ref,
             compression_level=self.pack_compression_level,
             progress=progress,
             object_format=self.object_format,
@@ -2332,7 +2340,7 @@ class DiskObjectStore(PackBasedObjectStore):
             # validates ingested objects this way via PackInflater; without
             # the same check DiskObjectStore was strictly weaker.
             for _obj in PackInflater.for_pack_data(
-                final_pack.data, resolve_ext_ref=self.get_raw
+                final_pack.data, resolve_ext_ref=resolve_ext_ref
             ):
                 pass
         except BaseException:
@@ -2356,6 +2364,7 @@ class DiskObjectStore(PackBasedObjectStore):
         progress: Callable[..., None] | None = None,
         *,
         max_input_size: int | None = None,
+        resolve_ext_ref: "ResolveExtRefFn | None" = None,
     ) -> "Pack":
         """Add a new thin pack to this object store.
 
@@ -2374,6 +2383,9 @@ class DiskObjectStore(PackBasedObjectStore):
             ``receive.maxInputSize`` / ``index-pack --max-input-size``
             semantics: ``None`` (the default) or ``0`` mean unlimited.
             Exceeding the cap raises ``PackInputTooLarge``.
+          resolve_ext_ref: Optional function to resolve external delta base
+            objects. Defaults to this store's ``get_raw``; a quarantine
+            store can pass a lookup that also sees the main object store.
         Returns: A Pack object pointing at the now-completed thin pack in the
             objects/pack directory.
         """
@@ -2383,6 +2395,8 @@ class DiskObjectStore(PackBasedObjectStore):
             read_all, read_some = _bound_read_callables(
                 read_all, read_some, max_input_size
             )
+        if resolve_ext_ref is None:
+            resolve_ext_ref = self.get_raw
 
         fd, path = tempfile.mkstemp(dir=self.path, prefix="tmp_pack_")
         with os.fdopen(fd, "w+b") as f:
@@ -2390,7 +2404,7 @@ class DiskObjectStore(PackBasedObjectStore):
             indexer = PackIndexer(
                 f,
                 self.object_format.hash_func,
-                resolve_ext_ref=self.get_raw,
+                resolve_ext_ref=resolve_ext_ref,
             )
             copier = PackStreamCopier(
                 self.object_format.hash_func,
@@ -2403,7 +2417,14 @@ class DiskObjectStore(PackBasedObjectStore):
             entries, ext_refs = self._index_pack(
                 indexer, len(copier), progress=progress
             )
-            return self._complete_pack(f, path, entries, ext_refs, progress=progress)
+            return self._complete_pack(
+                f,
+                path,
+                entries,
+                ext_refs,
+                progress=progress,
+                resolve_ext_ref=resolve_ext_ref,
+            )
 
     def add_pack(
         self,
@@ -2977,11 +2998,19 @@ class MemoryObjectStore(PackCapableObjectStore):
         for obj, path in objects:
             self.add_object(obj)
 
-    def add_pack(self) -> tuple[BinaryIO, Callable[[], None], Callable[[], None]]:
+    def add_pack(
+        self,
+        *,
+        resolve_ext_ref: "ResolveExtRefFn | None" = None,
+    ) -> tuple[BinaryIO, Callable[[], None], Callable[[], None]]:
         """Add a new pack to this object store.
 
         Because this object store doesn't support packs, we extract and add the
         individual objects.
+
+        Args:
+          resolve_ext_ref: Optional function to resolve external delta base
+            objects. Defaults to this store's ``get_raw``.
 
         Returns: Fileobject to write to and a commit function to
             call when the pack is finished.
@@ -2989,6 +3018,8 @@ class MemoryObjectStore(PackCapableObjectStore):
         from tempfile import SpooledTemporaryFile
 
         f = SpooledTemporaryFile(max_size=PACK_SPOOL_FILE_MAX_SIZE, prefix="incoming-")
+        if resolve_ext_ref is None:
+            resolve_ext_ref = self.get_raw
 
         def commit() -> None:
             size = f.tell()
@@ -3006,7 +3037,7 @@ class MemoryObjectStore(PackCapableObjectStore):
                     # ``add_thin_pack`` already validates via
                     # ``PackStreamCopier.verify``; do the equivalent here.
                     p.check()
-                    for obj in PackInflater.for_pack_data(p, self.get_raw):
+                    for obj in PackInflater.for_pack_data(p, resolve_ext_ref):
                         self.add_object(obj)
                 finally:
                     p.close()
@@ -3058,6 +3089,9 @@ class MemoryObjectStore(PackCapableObjectStore):
         read_all: Callable[[int], bytes],
         read_some: Callable[[int], bytes] | None,
         progress: Callable[[str], None] | None = None,
+        *,
+        resolve_ext_ref: "ResolveExtRefFn | None" = None,
+        max_input_size: int | None = None,
     ) -> None:
         """Add a new thin pack to this object store.
 
@@ -3071,8 +3105,17 @@ class MemoryObjectStore(PackCapableObjectStore):
           read_some: Read function that returns at least one byte, but may
             not return the number of bytes requested.
           progress: Optional progress reporting function.
+          resolve_ext_ref: Optional function to resolve external delta base
+            objects. Defaults to this store's ``get_raw``.
+          max_input_size: Maximum number of bytes that may be read from
+            the wire while ingesting this pack. ``None`` (the default) or
+            ``0`` mean unlimited.
         """
-        f, commit, abort = self.add_pack()
+        if max_input_size:
+            read_all, read_some = _bound_read_callables(
+                read_all, read_some, max_input_size
+            )
+        f, commit, abort = self.add_pack(resolve_ext_ref=resolve_ext_ref)
         try:
             copier = PackStreamCopier(
                 self.object_format.hash_func,

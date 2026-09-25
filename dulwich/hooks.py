@@ -98,6 +98,11 @@ class ShellHook(Hook):
 
         self.cwd = cwd
 
+        # Extra environment variables to expose to the hook subprocess
+        # (e.g. GIT_OBJECT_DIRECTORY while a receive-pack quarantine is
+        # active). Merged over os.environ at execution time.
+        self.env: dict[str, str] = {}
+
     def execute(self, *args: Any) -> Any:  # noqa: ANN401
         """Execute the hook with given args."""
         if len(args) != self.numparam:
@@ -110,7 +115,9 @@ class ShellHook(Hook):
 
         try:
             ret = subprocess.call(
-                [os.path.relpath(self.filepath, self.cwd), *list(args)], cwd=self.cwd
+                [os.path.relpath(self.filepath, self.cwd), *list(args)],
+                cwd=self.cwd,
+                env={**os.environ, **self.env} if self.env else None,
             )
             if ret != 0:
                 if self.post_exec_callback is not None:
@@ -222,6 +229,7 @@ class PostReceiveShellHook(ShellHook):
         try:
             env = os.environ.copy()
             env["GIT_DIR"] = self.controldir
+            env.update(self.env)
 
             p = subprocess.Popen(
                 self.filepath,
@@ -283,6 +291,7 @@ class PreReceiveShellHook(ShellHook):
         try:
             env = os.environ.copy()
             env["GIT_DIR"] = self.controldir
+            env.update(self.env)
 
             p = subprocess.Popen(
                 self.filepath,
@@ -342,6 +351,7 @@ class UpdateShellHook(ShellHook):
         try:
             env = os.environ.copy()
             env["GIT_DIR"] = self.controldir
+            env.update(self.env)
 
             p = subprocess.Popen(
                 [
