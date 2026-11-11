@@ -376,6 +376,18 @@ class ReceivePackHandlerTestCase(TestCase):
             backend, [b"/", b"host=lolcathost"], TestProto()
         )
 
+    def _attach_empty_pack(self, handler=None) -> None:
+        # Ref updates that point at non-zero shas make _apply_pack consume a
+        # pack stream first; feed it an empty, valid pack.
+        if handler is None:
+            handler = self._handler
+        pack = BytesIO()
+        write_pack_objects(
+            pack.write, [], object_format=self._repo.object_format
+        )
+        pack.seek(0)
+        handler.proto.read = pack.read
+
     def test_apply_pack_del_ref(self) -> None:
         refs = {b"refs/heads/master": TWO, b"refs/heads/fake-branch": ONE}
         self._repo.refs._update(refs)
@@ -427,6 +439,196 @@ class ReceivePackHandlerTestCase(TestCase):
             ],
             status,
         )
+
+    def test_atomic_capability_advertised_for_supporting_backend(self) -> None:
+        # MemoryRepo uses DictRefsContainer, which supports transactions.
+        self.assertIn(b"atomic", self._handler.capabilities())
+
+    def test_atomic_capability_hidden_for_unsupported_backend(self) -> None:
+        from dulwich.reftable import ReftableRefsContainer
+
+        reftable_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, reftable_dir)
+        refs = ReftableRefsContainer(reftable_dir)
+        self.assertFalse(refs.supports_atomic_updates)
+        original = self._repo.refs
+        self._repo.refs = refs
+        try:
+            self.assertNotIn(b"atomic", self._handler.capabilities())
+        finally:
+            self._repo.refs = original
+
+    def test_atomic_push_applies_all_refs(self) -> None:
+        self._repo.refs._update(
+            {b"refs/heads/a": ONE, b"refs/heads/b": TWO}
+        )
+        self._handler.set_client_capabilities([b"atomic", b"delete-refs"])
+        self._attach_empty_pack()
+        status = list(
+            self._handler._apply_pack(
+                [(ONE, THREE, b"refs/heads/a"), (TWO, FOUR, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"ok"),
+                (b"refs/heads/b", b"ok"),
+            ],
+            status,
+        )
+        self.assertEqual(THREE, self._repo.refs[b"refs/heads/a"])
+        self.assertEqual(FOUR, self._repo.refs[b"refs/heads/b"])
+
+    def test_atomic_push_cas_failure_changes_nothing(self) -> None:
+        self._repo.refs._update(
+            {b"refs/heads/a": ONE, b"refs/heads/b": TWO}
+        )
+        self._handler.set_client_capabilities([b"atomic", b"delete-refs"])
+        self._attach_empty_pack()
+        # A concurrent writer moves b before the transaction is applied.
+        original_batch = self._repo.refs.batch_update_if_equals
+
+        def racing_batch(updates):
+            self._repo.refs._refs[b"refs/heads/b"] = FIVE
+            return original_batch(updates)
+
+        self._repo.refs.batch_update_if_equals = racing_batch
+        status = list(
+            self._handler._apply_pack(
+                [(ONE, THREE, b"refs/heads/a"), (TWO, FOUR, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"atomic push failed"),
+                (b"refs/heads/b", b"failed to write"),
+            ],
+            status,
+        )
+        # Our push committed nothing; the other writer's value is preserved.
+        self.assertEqual(ONE, self._repo.refs[b"refs/heads/a"])
+        self.assertEqual(FIVE, self._repo.refs[b"refs/heads/b"])
+
+    def test_atomic_push_delete_cas_failure_changes_nothing(self) -> None:
+        self._repo.refs._update(
+            {b"refs/heads/a": ONE, b"refs/heads/b": TWO}
+        )
+        self._handler.set_client_capabilities([b"atomic", b"delete-refs"])
+        self._attach_empty_pack()
+        # The advertised old value of a is already stale.
+        status = list(
+            self._handler._apply_pack(
+                [(FIVE, ZERO_SHA, b"refs/heads/a"), (TWO, THREE, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"failed to delete"),
+                (b"refs/heads/b", b"atomic push failed"),
+            ],
+            status,
+        )
+        self.assertEqual(ONE, self._repo.refs[b"refs/heads/a"])
+        self.assertEqual(TWO, self._repo.refs[b"refs/heads/b"])
+
+    def test_atomic_push_backend_error_changes_nothing(self) -> None:
+        self._repo.refs._update(
+            {b"refs/heads/a": ONE, b"refs/heads/b": TWO}
+        )
+        self._handler.set_client_capabilities([b"atomic", b"delete-refs"])
+        self._attach_empty_pack()
+
+        def failing_batch(updates):
+            raise OSError("cannot start transaction")
+
+        self._repo.refs.batch_update_if_equals = failing_batch
+        status = list(
+            self._handler._apply_pack(
+                [(ONE, THREE, b"refs/heads/a"), (TWO, FOUR, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"atomic push failed"),
+                (b"refs/heads/b", b"atomic push failed"),
+            ],
+            status,
+        )
+        self.assertEqual(ONE, self._repo.refs[b"refs/heads/a"])
+        self.assertEqual(TWO, self._repo.refs[b"refs/heads/b"])
+
+    def test_non_atomic_push_reports_cas_failure_per_ref(self) -> None:
+        self._repo.refs._update(
+            {b"refs/heads/a": ONE, b"refs/heads/b": TWO}
+        )
+        self._handler.set_client_capabilities([b"delete-refs"])
+        self._attach_empty_pack()
+        status = list(
+            self._handler._apply_pack(
+                [(FIVE, THREE, b"refs/heads/a"), (TWO, FOUR, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"failed to write"),
+                (b"refs/heads/b", b"ok"),
+            ],
+            status,
+        )
+        # The rejected ref is untouched while the other ref still updates.
+        self.assertEqual(ONE, self._repo.refs[b"refs/heads/a"])
+        self.assertEqual(FOUR, self._repo.refs[b"refs/heads/b"])
+
+    def test_atomic_push_disk_lock_failure_changes_nothing(self) -> None:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path)
+        repo = Repo.init_bare(path)
+        self.addCleanup(repo.close)
+        repo.refs[b"refs/heads/a"] = ONE
+        repo.refs[b"refs/heads/b"] = TWO
+        c1 = make_commit()
+        repo.object_store.add_object(c1)
+        pack = BytesIO()
+        write_pack_objects(pack.write, [], object_format=repo.object_format)
+        pack.seek(0)
+        proto = TestProto()
+        proto.read = pack.read
+        handler = ReceivePackHandler(DictBackend({b"/": repo}), [b"/"], proto)
+        handler.set_client_capabilities([b"atomic", b"delete-refs"])
+
+        from dulwich.file import GitFile
+
+        original_batch = repo.refs.batch_update_if_equals
+
+        def lock_blocked_batch(updates):
+            # Simulate another process holding the lock on ref b.
+            lock = GitFile(repo.refs.refpath(b"refs/heads/b"), "wb")
+            try:
+                return original_batch(updates)
+            finally:
+                lock.abort()
+
+        repo.refs.batch_update_if_equals = lock_blocked_batch
+        status = list(
+            handler._apply_pack(
+                [(ONE, c1.id, b"refs/heads/a"), (TWO, c1.id, b"refs/heads/b")]
+            )
+        )
+        self.assertEqual(
+            [
+                (b"unpack", b"ok"),
+                (b"refs/heads/a", b"atomic push failed"),
+                (b"refs/heads/b", b"atomic push failed"),
+            ],
+            status,
+        )
+        self.assertEqual(ONE, repo.refs[b"refs/heads/a"])
+        self.assertEqual(TWO, repo.refs[b"refs/heads/b"])
 
     def test_apply_pack_refuses_head_delete(self) -> None:
         self._repo.refs[b"refs/heads/master"] = ONE

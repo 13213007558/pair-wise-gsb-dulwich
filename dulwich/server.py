@@ -97,6 +97,7 @@ from .errors import (
     ObjectFormatException,
     UnexpectedCommandError,
 )
+from .file import FileLocked
 from .object_filters import (
     CombineFilter,
     FilterSpec,
@@ -1441,16 +1442,20 @@ class ReceivePackHandler(PackHandler):
         Returns:
             List of capability names including object-format for the repository
         """
-        return [
+        capabilities = [
             CAPABILITY_REPORT_STATUS,
             CAPABILITY_DELETE_REFS,
             CAPABILITY_QUIET,
-            CAPABILITY_ATOMIC,
             CAPABILITY_OFS_DELTA,
             CAPABILITY_SIDE_BAND_64K,
             CAPABILITY_NO_DONE,
             capability_object_format(self.repo.object_format.name),
         ]
+        # Only advertise atomic pushes when the refs backend can actually
+        # apply the updates as a single all-or-nothing transaction.
+        if self.repo.refs.supports_atomic_updates:
+            capabilities.append(CAPABILITY_ATOMIC)
+        return capabilities
 
     def _receive_max_input_size(self) -> int | None:
         """Return the configured ``receive.maxInputSize`` for this repo.
@@ -1485,6 +1490,7 @@ class ReceivePackHandler(PackHandler):
         all_exceptions = (
             IOError,
             OSError,
+            FileLocked,
             ChecksumMismatch,
             ApplyDeltaError,
             AssertionError,
@@ -1523,7 +1529,9 @@ class ReceivePackHandler(PackHandler):
         atomic = self.has_capability(CAPABILITY_ATOMIC)
 
         if atomic:
-            # Atomic push: validate all refs first, then apply all or none
+            # Atomic push: the refs backend applies every update in a single
+            # all-or-nothing transaction. Validation failures reject the whole
+            # push before the transaction is opened.
             ref_results: list[tuple[Ref, bytes]] = []
             has_failure = False
 
@@ -1539,22 +1547,18 @@ class ReceivePackHandler(PackHandler):
                 if hook_error:
                     ref_status = hook_error
                     has_failure = True
-                else:
-                    try:
-                        if sha == zero_sha:
-                            if CAPABILITY_DELETE_REFS not in self.capabilities():
-                                raise GitProtocolError(
-                                    "Attempted to delete refs without "
-                                    "delete-refs capability."
-                                )
-                    except KeyError:
-                        ref_status = b"bad ref"
-                        has_failure = True
+                elif sha == zero_sha:
+                    if CAPABILITY_DELETE_REFS not in self.capabilities():
+                        raise GitProtocolError(
+                            "Attempted to delete refs without "
+                            "delete-refs capability."
+                        )
 
                 ref_results.append((ref, ref_status))
 
             if has_failure:
-                # At least one ref failed validation; fail all refs
+                # At least one ref failed validation; fail all refs without
+                # touching any of them.
                 for ref, status in ref_results:
                     if status == b"ok":
                         yield (ref, b"atomic push failed")
@@ -1562,23 +1566,39 @@ class ReceivePackHandler(PackHandler):
                         yield (ref, status)
                 return
 
-            # All validations passed; apply all ref updates
-            for oldsha, sha, ref in refs:
-                ref_status = b"ok"
-                try:
-                    if sha == zero_sha:
-                        try:
-                            self.repo.refs.remove_if_equals(ref, oldsha)
-                        except all_exceptions:
-                            ref_status = b"failed to delete"
+            updates = [
+                (
+                    ref,
+                    None if oldsha == zero_sha else oldsha,
+                    None if sha == zero_sha else sha,
+                )
+                for oldsha, sha, ref in refs
+            ]
+            try:
+                failed_ref = self.repo.refs.batch_update_if_equals(updates)
+            except all_exceptions:
+                # The backend could not start or complete the transaction; its
+                # all-or-nothing contract guarantees nothing was committed.
+                failed_ref = None
+                transaction_failed = True
+            else:
+                transaction_failed = failed_ref is not None
+
+            if transaction_failed:
+                for oldsha, sha, ref in refs:
+                    if failed_ref is not None and ref == failed_ref:
+                        yield (
+                            ref,
+                            b"failed to delete"
+                            if sha == zero_sha
+                            else b"failed to write",
+                        )
                     else:
-                        try:
-                            self.repo.refs.set_if_equals(ref, oldsha, sha)
-                        except all_exceptions:
-                            ref_status = b"failed to write"
-                except KeyError:
-                    ref_status = b"bad ref"
-                yield (ref, ref_status)
+                        yield (ref, b"atomic push failed")
+                return
+
+            for oldsha, sha, ref in refs:
+                yield (ref, b"ok")
         else:
             for oldsha, sha, ref in refs:
                 ref_status = b"ok"
@@ -1591,28 +1611,38 @@ class ReceivePackHandler(PackHandler):
                 hook_error = self._on_update(ref, oldsha, sha)
                 if hook_error:
                     # Update hook declined this ref
-                    ref_status = hook_error
-                    yield (ref, ref_status)
+                    yield (ref, hook_error)
                     continue
 
-                try:
-                    if sha == zero_sha:
-                        if CAPABILITY_DELETE_REFS not in self.capabilities():
-                            raise GitProtocolError(
-                                "Attempted to delete refs without "
-                                "delete-refs capability."
-                            )
-                        try:
-                            self.repo.refs.remove_if_equals(ref, oldsha)
-                        except all_exceptions:
-                            ref_status = b"failed to delete"
+                if sha == zero_sha:
+                    if CAPABILITY_DELETE_REFS not in self.capabilities():
+                        raise GitProtocolError(
+                            "Attempted to delete refs without "
+                            "delete-refs capability."
+                        )
+                    try:
+                        succeeded = self.repo.refs.remove_if_equals(
+                            ref, None if oldsha == zero_sha else oldsha
+                        )
+                    except all_exceptions:
+                        ref_status = b"failed to delete"
                     else:
-                        try:
-                            self.repo.refs.set_if_equals(ref, oldsha, sha)
-                        except all_exceptions:
+                        if not succeeded:
+                            # The ref moved (or disappeared) since the client
+                            # advertised it; never overwrite another writer.
+                            ref_status = b"failed to delete"
+                else:
+                    try:
+                        succeeded = self.repo.refs.set_if_equals(
+                            ref, None if oldsha == zero_sha else oldsha, sha
+                        )
+                    except all_exceptions:
+                        ref_status = b"failed to write"
+                    else:
+                        if not succeeded:
+                            # The compare-and-swap lost a race; report this ref
+                            # individually instead of claiming success.
                             ref_status = b"failed to write"
-                except KeyError:
-                    ref_status = b"bad ref"
                 yield (ref, ref_status)
 
     def _report_status(self, status: Sequence[tuple[bytes, bytes]]) -> None:

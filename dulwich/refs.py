@@ -249,6 +249,13 @@ def set_ref_from_raw(refs: "RefsContainer", name: Ref, raw_ref: bytes) -> None:
 class RefsContainer:
     """A container for refs."""
 
+    #: Whether this container can apply several compare-and-swap updates as a
+    #: single all-or-nothing transaction via :meth:`batch_update_if_equals`.
+    #: Backends that cannot provide that guarantee must leave this False so
+    #: that callers (e.g. the receive-pack server) do not advertise the
+    #: protocol-level ``atomic`` capability.
+    supports_atomic_updates: bool = False
+
     def __init__(
         self,
         logger: Callable[
@@ -632,6 +639,37 @@ class RefsContainer:
         """
         raise NotImplementedError(self.remove_if_equals)
 
+    def batch_update_if_equals(
+        self,
+        updates: Iterable[tuple[Ref, ObjectID | None, ObjectID | None]],
+    ) -> Ref | None:
+        """Apply several compare-and-swap updates atomically.
+
+        Each update is a ``(name, old_ref, new_ref)`` tuple, matching the
+        arguments of :meth:`set_if_equals` and :meth:`remove_if_equals`: a
+        ``new_ref`` of None deletes the ref, any other value sets it. When
+        ``old_ref`` is not None the update only proceeds if the ref still has
+        that value.
+
+        The whole batch is all-or-nothing: either every update is applied or
+        none of them are. In particular, no update is applied when any of the
+        compare-and-swap checks fails, and values written by other writers are
+        never overwritten as part of a rollback.
+
+        Only available when :attr:`supports_atomic_updates` is True.
+
+        Args:
+          updates: Iterable of (name, old_ref, new_ref) tuples.
+        Returns:
+          None if all updates were applied, otherwise the name of the first
+          ref whose compare-and-swap check failed. On failure no refs are
+          modified.
+        Raises:
+          OSError: If a storage error (e.g. an unacquirable lock) prevents the
+            transaction; no refs are modified in that case.
+        """
+        raise NotImplementedError(self.batch_update_if_equals)
+
     def __delitem__(self, name: Ref) -> None:
         """Remove a refname.
 
@@ -679,6 +717,8 @@ class DictRefsContainer(RefsContainer):
     This container does not support symbolic or packed references and is not
     threadsafe.
     """
+
+    supports_atomic_updates = True
 
     def __init__(
         self,
@@ -882,6 +922,46 @@ class DictRefsContainer(RefsContainer):
             )
         return True
 
+    def batch_update_if_equals(
+        self,
+        updates: Iterable[tuple[Ref, ObjectID | None, ObjectID | None]],
+    ) -> Ref | None:
+        """Apply all compare-and-swap updates or none of them.
+
+        All old values are checked against the current refs before any
+        mutation takes place, so a failed check never leaves partially applied
+        updates behind.
+
+        Args:
+          updates: Iterable of (name, old_ref, new_ref) tuples; a new_ref of
+            None deletes the ref.
+        Returns:
+          None on success, otherwise the name of the first ref whose
+            compare-and-swap check failed, without modifying any refs.
+        """
+        batch = list(updates)
+        seen: set[Ref] = set()
+        for name, old_ref, new_ref in batch:
+            if name in seen:
+                raise ValueError(f"multiple updates for ref {name!r}")
+            seen.add(name)
+            if new_ref is not None:
+                self._check_refname(name)
+                self._check_ref_value(new_ref)
+            if old_ref is not None and self._refs.get(name, ZERO_SHA) != old_ref:
+                return name
+
+        for name, old_ref, new_ref in batch:
+            old = self._refs.get(name)
+            if new_ref is None:
+                self._refs.pop(name, None)
+                self._notify(name, None)
+            else:
+                self._refs[name] = new_ref
+                self._notify(name, new_ref)
+            self._log(name, old, new_ref)
+        return None
+
     def get_peeled(self, name: Ref) -> ObjectID | None:
         """Get peeled version of a reference."""
         return self._peeled.get(name)
@@ -920,6 +1000,8 @@ def _packed_refs_key(st: os.stat_result) -> _PackedRefsKey:
 
 class DiskRefsContainer(RefsContainer):
     """Refs container that reads refs from disk."""
+
+    supports_atomic_updates = True
 
     def __init__(
         self,
@@ -1491,6 +1573,200 @@ class DiskRefsContainer(RefsContainer):
                 break
 
         return True
+
+    def batch_update_if_equals(
+        self,
+        updates: Iterable[tuple[Ref, ObjectID | None, ObjectID | None]],
+    ) -> Ref | None:
+        """Apply all compare-and-swap updates as a single transaction.
+
+        Every affected loose ref is locked and its current value is compared
+        with the expected old value before anything is committed. If any check
+        fails, all locks are released without writing, so no ref changes. Only
+        once every check has succeeded are the lock files renamed into place,
+        mirroring git's lock-all / verify-all / commit-all ref transaction.
+
+        Args:
+          updates: Iterable of (name, old_ref, new_ref) tuples; a new_ref of
+            None deletes the ref.
+        Returns:
+          None on success, otherwise the name of the first ref whose
+            compare-and-swap check failed, without modifying any refs.
+        Raises:
+          OSError: If a lock cannot be acquired or storage fails while the
+            transaction is being prepared; no refs are modified.
+        """
+        batch = list(updates)
+
+        # Resolve symref targets (only sets follow symrefs) and make sure no
+        # ancestor of a loose ref is itself listed in packed-refs.
+        packed_refs = self.get_packed_refs()
+        plans: list[dict[str, Any]] = []
+        seen_paths: set[bytes] = set()
+        for name, old_ref, new_ref in batch:
+            self._check_refname(name)
+            if new_ref is not None:
+                self._check_ref_value(new_ref)
+                try:
+                    realnames, _ = self.follow(name)
+                    realname = realnames[-1]
+                except (KeyError, IndexError, SymrefLoop):
+                    realname = name
+                if not refname_is_safe(realname):
+                    raise RefFormatError(realname)
+            else:
+                # Deletes never follow symbolic references.
+                realname = name
+
+            probe_ref = Ref(os.path.dirname(realname))
+            while probe_ref:
+                if packed_refs.get(probe_ref, None) is not None:
+                    raise NotADirectoryError(self.refpath(realname))
+                probe_ref = Ref(os.path.dirname(probe_ref))
+
+            path = self.refpath(realname)
+            if path in seen_paths:
+                raise ValueError(f"multiple updates for ref {name!r}")
+            seen_paths.add(path)
+            ensure_dir_exists(os.path.dirname(path))
+            plans.append(
+                {
+                    "name": name,
+                    "realname": realname,
+                    "old_ref": old_ref,
+                    "new_ref": new_ref,
+                    "path": path,
+                    "lock": None,
+                    "remove_dirs": [],
+                    "noop": False,
+                }
+            )
+
+        locks: dict[bytes, Any] = {}
+        packed_lock: Any = None
+        try:
+            # Phase 1: acquire every lock. A failure here leaves nothing
+            # committed, since no lock is renamed until all are held.
+            for plan in plans:
+                plan["lock"] = GitFile(plan["path"], "wb")
+                locks[plan["path"]] = plan["lock"]
+
+            deletes_packed = any(
+                plan["new_ref"] is None
+                and plan["realname"] in self.get_packed_refs()
+                for plan in plans
+            )
+            if deletes_packed:
+                packed_path = os.path.join(self.path, b"packed-refs")
+                packed_lock = GitFile(packed_path, "wb")
+
+            # Phase 2: verify all expected old values while every lock is held.
+            # This phase is strictly read-only: no loose ref or packed-refs is
+            # touched, so a failed check never leaves a partial transaction.
+            for plan in plans:
+                old_ref = plan["old_ref"]
+                if old_ref is None:
+                    continue
+                realname = plan["realname"]
+                orig_ref = self._read_loose_ref_file(realname)
+                if orig_ref is None:
+                    orig_ref = self.get_packed_refs().get(realname, ZERO_SHA)
+                if orig_ref != old_ref:
+                    for held_lock in locks.values():
+                        held_lock.abort()
+                    if packed_lock is not None:
+                        packed_lock.abort()
+                    return plan["name"]
+
+            # Phase 3: prepare the packed-refs rewrite in memory and stage the
+            # loose ref contents. Nothing becomes visible until phase 4.
+            new_packed: dict[Ref, ObjectID] | None = None
+            new_peeled = None
+            if packed_lock is not None:
+                self._invalidate_packed_refs_cache()
+                new_packed = self.get_packed_refs().copy()
+                new_peeled = (
+                    self._peeled_refs.copy() if self._peeled_refs is not None else None
+                )
+                for plan in plans:
+                    if plan["new_ref"] is None and plan["realname"] in new_packed:
+                        del new_packed[plan["realname"]]
+                        if new_peeled is not None:
+                            new_peeled.pop(plan["realname"], None)
+
+            for plan in plans:
+                realname = plan["realname"]
+                new_ref = plan["new_ref"]
+                lock = plan["lock"]
+                if new_ref is None:
+                    # The lock keeps other writers out; the ref file itself is
+                    # unlinked while still holding it during the commit phase.
+                    parent = realname
+                    while True:
+                        try:
+                            parent_bytes, _ = parent.rsplit(b"/", 1)
+                            parent = Ref(parent_bytes)
+                        except ValueError:
+                            break
+                        if parent == b"refs":
+                            break
+                        plan["remove_dirs"].append(self.refpath(parent))
+                else:
+                    current_ref = self._read_loose_ref_file(realname)
+                    if current_ref is None:
+                        current_ref = packed_refs.get(realname, None)
+                    if current_ref is not None and current_ref == new_ref:
+                        # Already at the desired value; keep the no-op silent.
+                        lock.abort()
+                        plan["lock"] = None
+                        plan["noop"] = True
+                        del locks[plan["path"]]
+                        continue
+                    lock.write(new_ref + b"\n")
+
+            # Phase 4: commit. packed-refs is rewritten first (loose refs take
+            # precedence over it), then the loose lock files are renamed in.
+            if packed_lock is not None:
+                assert new_packed is not None
+                write_packed_refs(packed_lock, new_packed, new_peeled)
+                packed_lock.close()
+                packed_lock = None
+                self._invalidate_packed_refs_cache()
+
+            for plan in plans:
+                lock = plan["lock"]
+                if plan["new_ref"] is None:
+                    # Unlink the ref while its lock is still held, then release
+                    # the lock without renaming anything into place.
+                    assert lock is not None
+                    if os.path.lexists(plan["path"]):
+                        os.remove(plan["path"])
+                    lock.abort()
+                    del locks[plan["path"]]
+                    self._log(plan["realname"], plan["old_ref"], None)
+                elif not plan.get("noop", False):
+                    assert lock is not None
+                    lock.close()
+                    del locks[plan["path"]]
+                    self._log(
+                        plan["realname"], plan["old_ref"], plan["new_ref"]
+                    )
+        finally:
+            for lock in locks.values():
+                if not lock.closed:
+                    lock.abort()
+            if packed_lock is not None and not packed_lock.closed:
+                packed_lock.abort()
+            self._invalidate_packed_refs_cache()
+
+        for plan in plans:
+            for parent_filename in plan["remove_dirs"]:
+                try:
+                    os.rmdir(parent_filename)
+                except OSError:
+                    break
+
+        return None
 
     def pack_refs(self, all: bool = False) -> None:
         """Pack loose refs into packed-refs file.

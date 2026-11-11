@@ -181,6 +181,10 @@ class TestReftableRefsContainer(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.container.read_loose_ref(b"refs/heads/master")
 
+    def test_no_atomic_update_support(self):
+        """Reftable backend must not advertise all-or-nothing transactions."""
+        self.assertFalse(self.container.supports_atomic_updates)
+
     def test_add_ref(self):
         """Test adding a reference."""
         sha = b"a" * 40

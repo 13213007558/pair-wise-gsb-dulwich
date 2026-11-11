@@ -420,6 +420,87 @@ class RefsContainerTests:
         self.assertTrue(self._refs.remove_if_equals(b"refs/tags/refs-0.2", ZERO_SHA))
         self.assertNotIn(b"refs/tags/refs-0.2", self._refs)
 
+    def test_batch_update_applies_all_updates(self) -> None:
+        master = b"42d06bd4b77fed026b154d16493e5deab78f02ec"
+        nines = b"9" * 40
+        failed = self._refs.batch_update_if_equals(
+            [
+                (b"refs/heads/master", master, nines),
+                (b"refs/tags/refs-0.1", None, ONES),
+            ]
+        )
+        self.assertIsNone(failed)
+        self.assertEqual(nines, self._refs[b"refs/heads/master"])
+        self.assertEqual(ONES, self._refs[b"refs/tags/refs-0.1"])
+
+    def test_batch_update_mixed_set_and_delete(self) -> None:
+        tag = b"refs/tags/refs-0.2"
+        tag_sha = b"3ec9c43c84ff242e3ef4a9fc5bc111fd780a76a8"
+        failed = self._refs.batch_update_if_equals(
+            [
+                (tag, tag_sha, None),
+                (b"refs/heads/master", None, ONES),
+            ]
+        )
+        self.assertIsNone(failed)
+        self.assertNotIn(tag, self._refs)
+        self.assertEqual(ONES, self._refs[b"refs/heads/master"])
+
+    def test_batch_update_cas_failure_changes_nothing(self) -> None:
+        master = b"42d06bd4b77fed026b154d16493e5deab78f02ec"
+        tag = b"refs/tags/refs-0.2"
+        tag_sha = b"3ec9c43c84ff242e3ef4a9fc5bc111fd780a76a8"
+        snapshot = self._refs.as_dict()
+        # The second update carries a stale expected value for the tag.
+        failed = self._refs.batch_update_if_equals(
+            [
+                (b"refs/heads/master", master, ONES),
+                (tag, b"0" * 40, TWOS),
+            ]
+        )
+        self.assertEqual(tag, failed)
+        # No part of the transaction is visible.
+        self.assertEqual(snapshot, self._refs.as_dict())
+
+    def test_batch_update_delete_cas_failure_changes_nothing(self) -> None:
+        tag = b"refs/tags/refs-0.2"
+        snapshot = self._refs.as_dict()
+        failed = self._refs.batch_update_if_equals(
+            [
+                (b"refs/heads/master", None, ONES),
+                (tag, b"0" * 40, None),
+            ]
+        )
+        self.assertEqual(tag, failed)
+        self.assertEqual(snapshot, self._refs.as_dict())
+
+    def test_batch_update_creates_missing_ref_with_zero_old(self) -> None:
+        failed = self._refs.batch_update_if_equals(
+            [(b"refs/heads/new-branch", ZERO_SHA, ONES)]
+        )
+        self.assertIsNone(failed)
+        self.assertEqual(ONES, self._refs[b"refs/heads/new-branch"])
+
+    def test_batch_update_zero_old_rejects_existing_ref(self) -> None:
+        snapshot = self._refs.as_dict()
+        failed = self._refs.batch_update_if_equals(
+            [(b"refs/heads/master", ZERO_SHA, ONES)]
+        )
+        self.assertEqual(b"refs/heads/master", failed)
+        self.assertEqual(snapshot, self._refs.as_dict())
+
+    def test_batch_update_rejects_duplicate_ref(self) -> None:
+        snapshot = self._refs.as_dict()
+        self.assertRaises(
+            ValueError,
+            self._refs.batch_update_if_equals,
+            [
+                (b"refs/heads/master", None, ONES),
+                (b"refs/heads/master", None, TWOS),
+            ],
+        )
+        self.assertEqual(snapshot, self._refs.as_dict())
+
     def test_import_refs_name(self) -> None:
         self._refs[b"refs/remotes/origin/other"] = (
             b"48d01bd4b77fed026b154d16493e5deab78f02ec"

@@ -1,5 +1,16 @@
 1.2.22	UNRELEASED
 
+ * Make the ``atomic`` receive-pack capability honor its all-or-nothing
+   promise. Ref updates now go through a new
+   ``RefsContainer.batch_update_if_equals`` transaction that locks and
+   verifies every ref before committing any of them, so a stale old value,
+   a failed compare-and-delete, or an unacquirable lock no longer leaves
+   partially applied updates. The return values of ``set_if_equals`` /
+   ``remove_if_equals`` are checked instead of ignored, and other writers'
+   values are never overwritten on rollback. Backends without a transactional
+   implementation (reftable, namespaced refs) no longer advertise
+   ``atomic``; non-atomic pushes keep their per-ref status reports.
+
  * Reject pack indexes whose fanout claims more than 2**31-1 objects on
    32-bit platforms with AssertionError rather than OverflowError.
    (Jelmer Vernooĳ, #2574)
