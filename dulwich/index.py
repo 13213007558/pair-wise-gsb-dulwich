@@ -76,6 +76,7 @@ __all__ = [
     "iter_fresh_entries",
     "iter_fresh_objects",
     "locked_index",
+    "make_checkout_path_normalizer",
     "make_path_normalizer",
     "os_sep_bytes",
     "pathjoin",
@@ -2290,19 +2291,14 @@ def get_path_element_normalizer(config: "Config") -> Callable[[bytes], bytes]:
         return _normalize_path_element_default
 
 
-def make_path_normalizer(
-    config: "Config",
+def _build_path_normalizer(
+    ignorecase: bool, precompose: bool
 ) -> Callable[[bytes], bytes] | None:
-    """Build a path normalizer honoring ``core.ignorecase`` and ``core.precomposeunicode``.
+    """Build a path normalizer from explicit folding flags.
 
-    The returned callable maps a filesystem-form path to a canonical form
-    used to match equivalent paths (e.g. ``Foo.txt`` ↔ ``foo.txt`` when
-    ``core.ignorecase=true``, NFD ↔ NFC when ``core.precomposeunicode=true``).
-    Returns ``None`` when neither option is active so callers can skip the
-    comparison entirely.
+    Returns ``None`` when neither folding rule is active so callers can
+    skip the comparison entirely.
     """
-    ignorecase = config.get_boolean(b"core", b"ignorecase", False)
-    precompose = config.get_boolean(b"core", b"precomposeunicode", False)
     if not ignorecase and not precompose:
         return None
 
@@ -2321,6 +2317,49 @@ def make_path_normalizer(
         return path
 
     return normalize
+
+
+def make_path_normalizer(
+    config: "Config",
+) -> Callable[[bytes], bytes] | None:
+    """Build a path normalizer honoring ``core.ignorecase`` and ``core.precomposeunicode``.
+
+    The returned callable maps a filesystem-form path to a canonical form
+    used to match equivalent paths (e.g. ``Foo.txt`` ↔ ``foo.txt`` when
+    ``core.ignorecase=true``, NFD ↔ NFC when ``core.precomposeunicode=true``).
+    Returns ``None`` when neither option is active so callers can skip the
+    comparison entirely.
+    """
+    return _build_path_normalizer(
+        config.get_boolean(b"core", b"ignorecase", False),
+        config.get_boolean(b"core", b"precomposeunicode", False),
+    )
+
+
+def make_checkout_path_normalizer(
+    config: "Config",
+) -> Callable[[bytes], bytes] | None:
+    """Build a path normalizer reflecting the target filesystem's folding rules.
+
+    Like ``make_path_normalizer``, but ``core.ignorecase`` and
+    ``core.precomposeunicode`` default to the platform's typical filesystem
+    behavior (case-folding on Windows and macOS, Unicode-normalizing on
+    macOS) instead of False, matching the platform defaults
+    ``update_working_tree`` already uses. Either option can still be
+    overridden explicitly in the repository configuration.
+
+    Used to detect distinct tree paths that would resolve to the same file
+    on checkout; returns ``None`` when the filesystem is treated as fully
+    case- and normalization-sensitive.
+    """
+    import platform
+
+    return _build_path_normalizer(
+        config.get_boolean(
+            b"core", b"ignorecase", platform.system() in ("Windows", "Darwin")
+        ),
+        config.get_boolean(b"core", b"precomposeunicode", sys.platform == "darwin"),
+    )
 
 
 class InvalidPathError(Exception):
@@ -2620,6 +2659,7 @@ def build_index_from_tree(
     blob_normalizer: "FilterBlobNormalizer | None" = None,
     tree_encoding: str = "utf-8",
     object_format: ObjectFormat = DEFAULT_OBJECT_FORMAT,
+    path_normalizer: Callable[[bytes], bytes] | None = None,
 ) -> None:
     """Generate and materialize index from a tree.
 
@@ -2637,6 +2677,11 @@ def build_index_from_tree(
         endings when writing blobs to the working directory.
       tree_encoding: Encoding used for tree paths (default: utf-8)
       object_format: Object format of the repository the index belongs to
+      path_normalizer: An optional function mapping a tree path to the
+        canonical form the target filesystem would resolve it to (see
+        ``make_checkout_path_normalizer``). When provided, two distinct
+        tree paths that normalize to the same form abort the checkout with
+        ``InvalidPathError`` instead of silently overwriting each other.
 
     Note: existing index is wiped and contents are not merged
         in a working dir. Suitable only for fresh clones.
@@ -2649,6 +2694,11 @@ def build_index_from_tree(
     # directories, shared across the sorted iteration. See verify_leading_dirs.
     safe_prefix: list[bytes] = []
 
+    # Normalized forms of paths already materialized, used to catch two
+    # distinct tree paths that resolve to the same file on the target
+    # filesystem (case-fold or Unicode-normalization collisions).
+    seen_paths: dict[bytes, bytes] = {}
+
     for entry in iter_tree_contents(object_store, tree_id):
         assert (
             entry.path is not None and entry.mode is not None and entry.sha is not None
@@ -2657,6 +2707,10 @@ def build_index_from_tree(
         # files already written in place. This also refuses a leading path
         # that resolves through a symlink materialized by an earlier entry.
         verify_tree_path(entry.path, validate_path_element, safe_prefix, root_path)
+        if path_normalizer is not None:
+            previous = seen_paths.setdefault(path_normalizer(entry.path), entry.path)
+            if previous != entry.path:
+                raise InvalidPathError(entry.path)
         full_path = _tree_to_fs_path(root_path, entry.path, tree_encoding)
 
         if not os.path.exists(os.path.dirname(full_path)):
@@ -3317,6 +3371,11 @@ def update_working_tree(
     - Removing deleted files
     - Cleaning up empty directories
 
+    Distinct tree paths that would resolve to the same file on the target
+    filesystem (per ``core.ignorecase``/``core.precomposeunicode``, see
+    ``make_checkout_path_normalizer``) are refused with ``InvalidPathError``
+    before any change is applied.
+
     If ``core.sparseCheckout`` is enabled, paths outside the sparse-checkout
     patterns are recorded in the index with the skip-worktree bit set and
     kept out of the working tree.
@@ -3383,6 +3442,28 @@ def update_working_tree(
     if ignore_case:
         config = repo.get_config()
         changes = detect_case_only_renames(changes, config)
+
+    # Refuse distinct tree paths that resolve to the same file on the
+    # target filesystem (e.g. "Foo" and "foo" on a case-folding
+    # filesystem, or NFC/NFD spellings on a normalizing one); otherwise
+    # the later entry would silently overwrite the earlier one. Checked
+    # before any change is applied so the working tree is left untouched.
+    fs_path_normalizer = make_checkout_path_normalizer(config)
+    if fs_path_normalizer is not None:
+        seen_paths: dict[bytes, bytes] = {}
+        for change in changes:
+            if change.type in (
+                CHANGE_ADD,
+                CHANGE_MODIFY,
+                CHANGE_UNCHANGED,
+                CHANGE_COPY,
+                CHANGE_RENAME,
+            ):
+                assert change.new is not None and change.new.path is not None
+                new_path = change.new.path
+                previous = seen_paths.setdefault(fs_path_normalizer(new_path), new_path)
+                if previous != new_path:
+                    raise InvalidPathError(new_path)
 
     if not allow_overwrite_modified:
         # Check for path conflicts where files need to become directories

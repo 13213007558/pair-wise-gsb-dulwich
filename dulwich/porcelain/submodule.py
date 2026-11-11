@@ -188,7 +188,11 @@ def submodule_update(
       errstream: Error stream for error messages
     """
     from ..client import check_transport_allowed, get_transport_and_path
-    from ..index import build_index_from_tree, get_path_element_validator
+    from ..index import (
+        build_index_from_tree,
+        get_path_element_validator,
+        make_checkout_path_normalizer,
+    )
     from ..refs import HEADREF
     from ..submodule import iter_cached_submodules
     from . import (
@@ -320,6 +324,7 @@ def submodule_update(
                         sub_repo.object_store,
                         tree_id,
                         validate_path_element=path_validator,
+                        path_normalizer=make_checkout_path_normalizer(config),
                     )
             else:
                 # Fetch and checkout in existing submodule

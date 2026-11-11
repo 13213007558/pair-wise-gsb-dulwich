@@ -828,6 +828,7 @@ class WorkTree:
             build_index_from_tree,
             get_path_element_validator,
             get_symlink_fn,
+            make_checkout_path_normalizer,
         )
 
         if tree is None:
@@ -858,6 +859,7 @@ class WorkTree:
             symlink_fn=symlink_fn,
             blob_normalizer=blob_normalizer,
             object_format=self._repo.object_format,
+            path_normalizer=make_checkout_path_normalizer(config),
         )
 
     def _sparse_checkout_file_path(self) -> str:

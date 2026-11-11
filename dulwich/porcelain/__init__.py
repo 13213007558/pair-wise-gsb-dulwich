@@ -6798,7 +6798,11 @@ def cone_mode_disable(
         commit = repo_obj[repo_obj.head()]
         assert isinstance(commit, Commit)
 
-        from ..index import build_index_from_tree, get_path_element_validator
+        from ..index import (
+            build_index_from_tree,
+            get_path_element_validator,
+            make_checkout_path_normalizer,
+        )
 
         build_index_from_tree(
             repo_obj.path,
@@ -6806,6 +6810,7 @@ def cone_mode_disable(
             repo_obj.object_store,
             commit.tree,
             validate_path_element=get_path_element_validator(config),
+            path_normalizer=make_checkout_path_normalizer(config),
         )
 
 

@@ -80,6 +80,7 @@ from dulwich.index import (
     index_entry_from_path,
     index_entry_from_stat,
     iter_fresh_entries,
+    make_checkout_path_normalizer,
     make_path_normalizer,
     read_cache_entry,
     read_index,
@@ -117,6 +118,36 @@ def can_symlink() -> bool:
     except (NotImplementedError, OSError):
         return False
     return True
+
+
+def fs_ignores_case(dirpath: str) -> bool:
+    """Probe whether the filesystem at dirpath folds case.
+
+    Creates a real file and asks for it back under a different case, so
+    the answer reflects the actual filesystem rather than the platform.
+    """
+    probe = os.path.join(dirpath, "CaseFoldingProbe")
+    with open(probe, "w"):
+        pass
+    try:
+        return os.path.exists(os.path.join(dirpath, "casefoldingprobe"))
+    finally:
+        os.unlink(probe)
+
+
+def fs_normalizes_unicode(dirpath: str) -> bool:
+    """Probe whether the filesystem at dirpath folds Unicode normalization.
+
+    Creates a real file under an NFC name and asks for it back under the
+    NFD spelling (as HFS+/APFS would resolve it).
+    """
+    probe = os.path.join(dirpath, "é")
+    with open(probe, "w"):
+        pass
+    try:
+        return os.path.exists(os.path.join(dirpath, unicodedata.normalize("NFD", "é")))
+    finally:
+        os.unlink(probe)
 
 
 class DeprecatedReexportTests(TestCase):
@@ -1484,6 +1515,513 @@ class BuildIndexTests(TestCase):
             # autocrlf=true means LF -> CRLF on checkout (on all platforms for testing)
             expected_content = b"line1\r\nline2\r\nline3\r\n"
             self.assertEqual(content, expected_content)
+
+
+class UntrustedTreeCheckoutTests(TestCase):
+    """Regression tests for materializing untrusted trees.
+
+    A git tree can hold two distinct byte names that the target filesystem
+    resolves to the same path; checking such a tree out must not silently
+    overwrite another file or the repository's own metadata.
+
+    The refusals exercised here fall into two classes, recorded per test:
+
+    - Cross-platform policy: enforced on every platform regardless of the
+      underlying filesystem. ``.git`` under any case fold (the default
+      validator lowercases before comparing), HFS+/NTFS spellings of
+      ``.git`` (the protectHFS/protectNTFS validators, on by default via
+      ``get_path_element_validator``), and writes that would resolve
+      through a symlink.
+    - Filesystem limits: only a hazard where the target filesystem itself
+      folds names (case-insensitive or Unicode-normalizing). These are
+      enforced when a checkout path normalizer is active, derived from
+      ``core.ignorecase``/``core.precomposeunicode`` (with platform
+      defaults on Windows/macOS, see ``make_checkout_path_normalizer``)
+      or injected by the test as a controlled adapter standing in for the
+      folding filesystem.
+
+    Where the running platform's filesystem does not exhibit a folding
+    behavior, the controlled-adapter variant is the authoritative
+    coverage; the real-filesystem variant only corroborates it and is
+    skipped -- never counted as covered -- when the capability probe says
+    the filesystem is fully sensitive.
+    """
+
+    def make_repo(self) -> Repo:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        repo = Repo.init(repo_dir)
+        self.addCleanup(repo.close)
+        return repo
+
+    def _store_tree(self, repo: Repo, entries: dict[bytes, tuple[int, bytes]]) -> bytes:
+        """Store blobs/trees for {path: (mode, content)} and return the tree id."""
+
+        def build(level: dict) -> bytes:
+            tree = Tree()
+            for name, value in level.items():
+                if isinstance(value, dict):
+                    tree[name] = (stat.S_IFDIR, build(value))
+                else:
+                    mode, content = value
+                    blob = Blob.from_string(content)
+                    repo.object_store.add_object(blob)
+                    tree[name] = (mode, blob.id)
+            repo.object_store.add_object(tree)
+            return tree.id
+
+        nested: dict = {}
+        for path, value in entries.items():
+            node = nested
+            parts = path.split(b"/")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+        return build(nested)
+
+    def _snapshot_control_dir(self, repo: Repo) -> dict[str, bytes]:
+        """Map every file under .git to its content, for integrity checks."""
+        snapshot = {}
+        for dirpath, _dirnames, filenames in os.walk(repo.controldir()):
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                rel = os.path.relpath(full, repo.controldir())
+                with open(full, "rb") as f:
+                    snapshot[rel] = f.read()
+        return snapshot
+
+    def _assert_file_contents(self, path: str, contents: bytes) -> None:
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), contents)
+
+    def test_case_collision_refused_with_ignorecase_normalizer(self) -> None:
+        # Filesystem-limit refusal, verified through a controlled adapter:
+        # the injected normalizer stands in for a case-folding filesystem
+        # (core.ignorecase), so the check runs on any platform. "Foo.txt"
+        # sorts before "foo.txt" and is materialized first; the colliding
+        # second entry must abort the checkout, not overwrite it.
+        repo = self.make_repo()
+        tree_id = self._store_tree(
+            repo,
+            {
+                b"Foo.txt": (stat.S_IFREG | 0o644, b"first"),
+                b"foo.txt": (stat.S_IFREG | 0o644, b"second"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree_id,
+                path_normalizer=lambda path: path.lower(),
+            )
+
+        # The survivor holds the first entry's content; the colliding
+        # entry never reached the disk.
+        self._assert_file_contents(os.path.join(repo.path, "Foo.txt"), b"first")
+        if not fs_ignores_case(repo.path):
+            self.assertFalse(os.path.lexists(os.path.join(repo.path, "foo.txt")))
+        # The abort happened before the index was written, and the
+        # repository metadata is untouched.
+        self.assertFalse(os.path.exists(repo.index_path()))
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    @skipIf(
+        not fs_ignores_case(tempfile.gettempdir()),
+        "Requires a case-folding filesystem",
+    )
+    def test_case_collision_refused_on_case_folding_filesystem(self) -> None:
+        # Real-filesystem corroboration of the adapter test above: the
+        # probe in the skip condition established that this filesystem
+        # really folds case, and the normalizer comes from the repository
+        # configuration exactly as production callers derive it.
+        repo = self.make_repo()
+        config = repo.get_config()
+        config.set((b"core",), b"ignorecase", True)
+        config.write_to_path()
+        normalizer = make_checkout_path_normalizer(repo.get_config())
+        assert normalizer is not None
+
+        tree_id = self._store_tree(
+            repo,
+            {
+                b"Foo.txt": (stat.S_IFREG | 0o644, b"first"),
+                b"foo.txt": (stat.S_IFREG | 0o644, b"second"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree_id,
+                path_normalizer=normalizer,
+            )
+
+        # One file exists on this filesystem under both spellings; it must
+        # still hold the first entry's content.
+        self._assert_file_contents(os.path.join(repo.path, "foo.txt"), b"first")
+        self.assertFalse(os.path.exists(repo.index_path()))
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_checkout_case_collision_refused(self) -> None:
+        # The update_working_tree (checkout) counterpart, again with
+        # core.ignorecase as the controlled adapter. The collision is
+        # detected before any change is applied, so the working tree is
+        # left completely untouched.
+        repo = self.make_repo()
+        config = repo.get_config()
+        config.set((b"core",), b"ignorecase", True)
+        config.write_to_path()
+
+        empty_tree_id = self._store_tree(repo, {})
+        tree_id = self._store_tree(
+            repo,
+            {
+                b"Foo.txt": (stat.S_IFREG | 0o644, b"first"),
+                b"foo.txt": (stat.S_IFREG | 0o644, b"second"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            update_working_tree(
+                repo,
+                empty_tree_id,
+                tree_id,
+                tree_changes(repo.object_store, empty_tree_id, tree_id),
+            )
+
+        self.assertEqual(os.listdir(repo.path), [".git"])
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_dotgit_case_variants_refused(self) -> None:
+        # Cross-platform policy: the default path validator folds case, so
+        # these are refused everywhere. On a case-folding filesystem a
+        # ".GIT/config" entry would overwrite the repository's real
+        # configuration; the refusal protects it even when no checkout
+        # normalizer is active.
+        for evil_name in [b".GIT/config", b".Git/HEAD", b".giT/index"]:
+            repo = self.make_repo()
+            tree_id = self._store_tree(
+                repo,
+                {
+                    evil_name: (stat.S_IFREG | 0o644, b"payload"),
+                    b"ok.txt": (stat.S_IFREG | 0o644, b"ok"),
+                },
+            )
+            git_snapshot = self._snapshot_control_dir(repo)
+
+            with self.assertRaises(InvalidPathError):
+                build_index_from_tree(
+                    repo.path, repo.index_path(), repo.object_store, tree_id
+                )
+
+            # The evil entry sorts before "ok.txt", so nothing was
+            # materialized, and .git (config included) is byte-identical.
+            self.assertEqual(os.listdir(repo.path), [".git"])
+            self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_nfc_nfd_collision_refused_with_precompose_normalizer(self) -> None:
+        # Filesystem-limit refusal via controlled adapter: NFC and NFD
+        # spellings of the same name are distinct byte strings in the tree
+        # but one file on a normalizing filesystem (HFS+/APFS). The NFD
+        # spelling sorts first (b"e" < 0xC3) and wins the race.
+        repo = self.make_repo()
+        nfc_name = os.fsencode("é.txt")
+        nfd_name = os.fsencode(unicodedata.normalize("NFD", "é.txt"))
+        self.assertNotEqual(nfc_name, nfd_name)
+        tree_id = self._store_tree(
+            repo,
+            {
+                nfc_name: (stat.S_IFREG | 0o644, b"nfc"),
+                nfd_name: (stat.S_IFREG | 0o644, b"nfd"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        def precompose(path: bytes) -> bytes:
+            return unicodedata.normalize("NFC", path.decode("utf-8")).encode("utf-8")
+
+        with self.assertRaises(InvalidPathError):
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree_id,
+                path_normalizer=precompose,
+            )
+
+        survivor = os.path.join(repo.path, os.fsdecode(nfd_name))
+        self._assert_file_contents(survivor, b"nfd")
+        if not fs_normalizes_unicode(repo.path):
+            self.assertFalse(
+                os.path.lexists(os.path.join(repo.path, os.fsdecode(nfc_name)))
+            )
+        self.assertFalse(os.path.exists(repo.index_path()))
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    @skipIf(
+        not fs_normalizes_unicode(tempfile.gettempdir()),
+        "Requires a Unicode-normalizing filesystem",
+    )
+    def test_nfc_nfd_collision_refused_on_normalizing_filesystem(self) -> None:
+        # Real-filesystem corroboration of the adapter test above, with
+        # the normalizer derived from core.precomposeunicode as production
+        # callers do (Repo.init sets it by default on macOS).
+        repo = self.make_repo()
+        config = repo.get_config()
+        config.set((b"core",), b"precomposeunicode", True)
+        config.write_to_path()
+        normalizer = make_checkout_path_normalizer(repo.get_config())
+        assert normalizer is not None
+
+        nfc_name = os.fsencode("é.txt")
+        nfd_name = os.fsencode(unicodedata.normalize("NFD", "é.txt"))
+        tree_id = self._store_tree(
+            repo,
+            {
+                nfc_name: (stat.S_IFREG | 0o644, b"nfc"),
+                nfd_name: (stat.S_IFREG | 0o644, b"nfd"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree_id,
+                path_normalizer=normalizer,
+            )
+
+        # Both spellings resolve to the one file that was written first.
+        survivor = os.path.join(repo.path, os.fsdecode(nfc_name))
+        self._assert_file_contents(survivor, b"nfd")
+        self.assertFalse(os.path.exists(repo.index_path()))
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_checkout_nfc_nfd_collision_refused(self) -> None:
+        # The update_working_tree (checkout) counterpart, with
+        # core.precomposeunicode as the controlled adapter.
+        repo = self.make_repo()
+        config = repo.get_config()
+        config.set((b"core",), b"precomposeunicode", True)
+        config.write_to_path()
+
+        empty_tree_id = self._store_tree(repo, {})
+        nfc_name = os.fsencode("é.txt")
+        nfd_name = os.fsencode(unicodedata.normalize("NFD", "é.txt"))
+        tree_id = self._store_tree(
+            repo,
+            {
+                nfc_name: (stat.S_IFREG | 0o644, b"nfc"),
+                nfd_name: (stat.S_IFREG | 0o644, b"nfd"),
+            },
+        )
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            update_working_tree(
+                repo,
+                empty_tree_id,
+                tree_id,
+                tree_changes(repo.object_store, empty_tree_id, tree_id),
+            )
+
+        self.assertEqual(os.listdir(repo.path), [".git"])
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_hfs_ignorable_dotgit_refused(self) -> None:
+        # Cross-platform policy: the protectHFS validator strips HFS+
+        # ignorable codepoints and rejects malformed UTF-8 on every
+        # platform, so a ".git" spelling that only HFS+ would resolve to
+        # the metadata directory is refused even on Linux. Injected
+        # explicitly here; get_path_element_validator enables it by
+        # default on macOS.
+        evil_names = [
+            # ZERO WIDTH NON-JOINER inside ".git"
+            ".g\u200cit".encode(),
+            # ZERO WIDTH NO-BREAK SPACE after ".git"
+            ".git\ufeff".encode(),
+            # malformed UTF-8: conservatively rejected
+            b".\xffgit",
+        ]
+        for evil_name in evil_names:
+            repo = self.make_repo()
+            tree_id = self._store_tree(
+                repo,
+                {
+                    evil_name: (stat.S_IFREG | 0o644, b"payload"),
+                    b"ok.txt": (stat.S_IFREG | 0o644, b"ok"),
+                },
+            )
+            git_snapshot = self._snapshot_control_dir(repo)
+
+            with self.assertRaises(InvalidPathError):
+                build_index_from_tree(
+                    repo.path,
+                    repo.index_path(),
+                    repo.object_store,
+                    tree_id,
+                    validate_path_element=validate_path_element_hfs,
+                )
+
+            self.assertEqual(os.listdir(repo.path), [".git"])
+            self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_checkout_file_replaces_symlink_to_git_metadata(self) -> None:
+        # Cross-platform policy: a tracked file is never written through a
+        # symlink. Here the pre-existing link points at the repository's
+        # own configuration, so writing through it would corrupt metadata.
+        repo = self.make_repo()
+        link_path = os.path.join(repo.path, "hook")
+        os.symlink(os.path.join(repo.controldir(), "config"), link_path)
+
+        empty_tree_id = self._store_tree(repo, {})
+        tree_id = self._store_tree(repo, {b"hook": (stat.S_IFREG | 0o644, b"payload")})
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        update_working_tree(
+            repo,
+            empty_tree_id,
+            tree_id,
+            tree_changes(repo.object_store, empty_tree_id, tree_id),
+        )
+
+        # The link was replaced, not followed.
+        self.assertFalse(os.path.islink(link_path))
+        self._assert_file_contents(link_path, b"payload")
+        after = self._snapshot_control_dir(repo)
+        # The index is legitimately written by the checkout; everything
+        # else under .git, config included, must be byte-identical.
+        after.pop("index", None)
+        self.assertEqual(git_snapshot, after)
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_checkout_through_symlinked_dir_refused(self) -> None:
+        # Cross-platform policy: a checkout never resolves a leading path
+        # component through a symlink (CVE-2021-21300 style). The tree
+        # materializes "link" as a symlink to an outside directory and
+        # then tries to write "link/payload" through it.
+        repo = self.make_repo()
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir)
+
+        empty_tree_id = self._store_tree(repo, {})
+        # A single Tree object holds both the symlink and a descendant
+        # path (an invalid-but-storable tree, as iter_tree_contents
+        # flattens it); _store_tree cannot nest "link" below itself.
+        link = Blob.from_string(os.fsencode(outside_dir))
+        payload = Blob.from_string(b"pwned")
+        tree = Tree()
+        tree[b"link"] = (stat.S_IFLNK, link.id)
+        tree[b"link/payload"] = (stat.S_IFREG | 0o644, payload.id)
+        repo.object_store.add_objects([(o, None) for o in [link, payload, tree]])
+        tree_id = tree.id
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(InvalidPathError):
+            update_working_tree(
+                repo,
+                empty_tree_id,
+                tree_id,
+                tree_changes(repo.object_store, empty_tree_id, tree_id),
+            )
+
+        # Nothing escaped through the symlink, and .git is untouched.
+        self.assertEqual(os.listdir(outside_dir), [])
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
+
+    def test_checkout_directory_replaced_by_file(self) -> None:
+        # A directory holding tracked files is replaced by a regular file
+        # at the same path: the directory's contents are removed first and
+        # the file lands cleanly.
+        repo = self.make_repo()
+        empty_tree_id = self._store_tree(repo, {})
+        old_tree_id = self._store_tree(
+            repo, {b"sub/file": (stat.S_IFREG | 0o644, b"old")}
+        )
+        new_tree_id = self._store_tree(repo, {b"sub": (stat.S_IFREG | 0o644, b"new")})
+
+        update_working_tree(
+            repo,
+            empty_tree_id,
+            old_tree_id,
+            tree_changes(repo.object_store, empty_tree_id, old_tree_id),
+        )
+        update_working_tree(
+            repo,
+            old_tree_id,
+            new_tree_id,
+            tree_changes(repo.object_store, old_tree_id, new_tree_id),
+        )
+
+        sub_path = os.path.join(repo.path, "sub")
+        self.assertFalse(os.path.isdir(sub_path))
+        self._assert_file_contents(sub_path, b"new")
+        self.assertEqual(list(repo.open_index()), [b"sub"])
+
+    def test_checkout_file_replaced_by_directory(self) -> None:
+        # The inverse: a regular file is replaced by a directory at the
+        # same path.
+        repo = self.make_repo()
+        empty_tree_id = self._store_tree(repo, {})
+        old_tree_id = self._store_tree(repo, {b"sub": (stat.S_IFREG | 0o644, b"old")})
+        new_tree_id = self._store_tree(
+            repo, {b"sub/file": (stat.S_IFREG | 0o644, b"new")}
+        )
+
+        update_working_tree(
+            repo,
+            empty_tree_id,
+            old_tree_id,
+            tree_changes(repo.object_store, empty_tree_id, old_tree_id),
+        )
+        update_working_tree(
+            repo,
+            old_tree_id,
+            new_tree_id,
+            tree_changes(repo.object_store, old_tree_id, new_tree_id),
+        )
+
+        self._assert_file_contents(os.path.join(repo.path, "sub", "file"), b"new")
+        self.assertEqual(list(repo.open_index()), [b"sub/file"])
+
+    def test_checkout_file_over_untracked_nonempty_dir_refused(self) -> None:
+        # A tree that turns an untracked, non-empty directory into a file
+        # must be refused; silently removing the directory would destroy
+        # data the repository does not track.
+        repo = self.make_repo()
+        keep_path = os.path.join(repo.path, "sub", "keep.txt")
+        os.makedirs(os.path.dirname(keep_path))
+        with open(keep_path, "wb") as f:
+            f.write(b"keep")
+
+        empty_tree_id = self._store_tree(repo, {})
+        tree_id = self._store_tree(repo, {b"sub": (stat.S_IFREG | 0o644, b"new")})
+        git_snapshot = self._snapshot_control_dir(repo)
+
+        with self.assertRaises(IsADirectoryError):
+            update_working_tree(
+                repo,
+                empty_tree_id,
+                tree_id,
+                tree_changes(repo.object_store, empty_tree_id, tree_id),
+            )
+
+        # The untracked directory survived and no index entry was recorded.
+        self.assertTrue(os.path.isdir(os.path.join(repo.path, "sub")))
+        self._assert_file_contents(keep_path, b"keep")
+        self.assertFalse(os.path.exists(repo.index_path()))
+        self.assertEqual(git_snapshot, self._snapshot_control_dir(repo))
 
 
 class GetUnstagedChangesTests(TestCase):
