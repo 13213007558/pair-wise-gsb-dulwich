@@ -37,20 +37,24 @@ from dulwich.errors import (
 )
 from dulwich.object_filters import BlobNoneFilter
 from dulwich.object_store import MemoryObjectStore, find_shallow
-from dulwich.objects import Tree
+from dulwich.objects import ObjectID, Tree
 from dulwich.pack import write_pack_objects
-from dulwich.protocol import ZERO_SHA, format_capability_line
+from dulwich.protocol import ZERO_SHA, Protocol, format_capability_line, pkt_line
+from dulwich.refs import Ref
 from dulwich.repo import MemoryRepo, Repo
 from dulwich.server import (
     Backend,
     DictBackend,
     FileSystemBackend,
+    InMemoryNonceStore,
     MultiAckDetailedGraphWalkerImpl,
     MultiAckGraphWalkerImpl,
     PackHandler,
+    PushCertificateError,
     ReceivePackHandler,
     SingleAckGraphWalkerImpl,
     UploadPackHandler,
+    _parse_push_certificate,
     _ProtocolGraphWalker,
     _split_proto_line,
     serve_command,
@@ -86,6 +90,12 @@ class TestProto:
                 return None
         else:
             raise HangupException
+
+    def read_pkt_seq(self):
+        pkt = self.read_pkt_line()
+        while pkt:
+            yield pkt
+            pkt = self.read_pkt_line()
 
     def write_sideband(self, band, data) -> None:
         self._received[band].append(data)
@@ -597,6 +607,446 @@ class ReceivePackHandlerTestCase(TestCase):
         )
         self._handler.handle()
         mock_hook.execute.assert_not_called()
+
+
+class RecordingVerifier:
+    """Controllable push certificate verifier for tests."""
+
+    def __init__(self, result: bool = True, raises: Exception | None = None) -> None:
+        self.result = result
+        self.raises = raises
+        self.calls: list[bytes] = []
+
+    def verify(self, certificate) -> bool:
+        self.calls.append(certificate.cert)
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+def make_cert_pkt_lines(
+    nonce: bytes,
+    commands: list[tuple[bytes, bytes, bytes]],
+    *,
+    signature: bytes = b"fakesig",
+    pushee: bytes = b"example.com",
+    push_options: list[bytes] | None = None,
+) -> list[bytes]:
+    """Build the pkt-line payload of a v0.1 push certificate."""
+    lines = [
+        b"certificate version 0.1",
+        b"pusher " + pushee,
+        b"pushee " + pushee,
+        b"nonce " + nonce,
+        b"pushee",
+    ]
+    lines.extend(old + b" " + new + b" " + ref for old, new, ref in commands)
+    lines.append(b"gpgsig " + signature)
+    lines.append(b"end-cert")
+    if push_options:
+        lines.extend(push_options)
+    return lines
+
+
+class PushCertificateParsingTestCase(TestCase):
+    def test_parse_minimal_certificate(self) -> None:
+        nonce = b"the-nonce"
+        commands = [(ONE, TWO, b"refs/heads/master")]
+        cert = _parse_push_certificate(make_cert_pkt_lines(nonce, commands))
+        self.assertEqual(nonce, cert.nonce)
+        self.assertEqual(
+            [(ObjectID(ONE), ObjectID(TWO), Ref(b"refs/heads/master"))],
+            cert.commands,
+        )
+        self.assertEqual(b"fakesig\n", cert.signature)
+        self.assertIn(b"nonce the-nonce\n", cert.cert)
+        self.assertTrue(cert.cert.endswith(ONE + b" " + TWO + b" refs/heads/master\n"))
+
+    def test_parse_keeps_signed_bytes_exact(self) -> None:
+        lines = make_cert_pkt_lines(
+            b"n",
+            [(ZERO_SHA, ONE, b"refs/heads/new")],
+            push_options=[b"ci=true"],
+        )
+        cert = _parse_push_certificate(lines)
+        self.assertEqual([b"ci=true"], cert.push_options)
+        self.assertEqual(
+            b"certificate version 0.1\n"
+            b"pusher example.com\n"
+            b"pushee example.com\n"
+            b"nonce n\n"
+            b"pushee\n" + ZERO_SHA + b" " + ONE + b" refs/heads/new\n",
+            cert.cert,
+        )
+
+    def test_parse_multi_line_signature(self) -> None:
+        lines = [
+            b"certificate version 0.1",
+            b"nonce n",
+            b"pushee",
+            ONE + b" " + TWO + b" refs/heads/master",
+            b"gpgsig -----BEGIN PGP SIGNATURE-----",
+            b"gpgsig abc",
+            b"gpgsig def",
+            b"gpgsig -----END PGP SIGNATURE-----",
+            b"end-cert",
+        ]
+        cert = _parse_push_certificate(lines)
+        self.assertEqual(
+            b"-----BEGIN PGP SIGNATURE-----\nabc\ndef\n"
+            b"-----END PGP SIGNATURE-----\n",
+            cert.signature,
+        )
+
+    def test_parse_rejects_unknown_version(self) -> None:
+        lines = make_cert_pkt_lines(b"n", [])
+        lines[0] = b"certificate version 9.9"
+        self.assertRaises(PushCertificateError, _parse_push_certificate, lines)
+
+    def test_parse_rejects_missing_nonce(self) -> None:
+        lines = make_cert_pkt_lines(b"n", [])
+        lines = [line for line in lines if not line.startswith(b"nonce ")]
+        self.assertRaises(PushCertificateError, _parse_push_certificate, lines)
+
+    def test_parse_rejects_malformed_command(self) -> None:
+        lines = make_cert_pkt_lines(b"n", [])
+        lines.insert(4, b"garbage-command")
+        self.assertRaises(PushCertificateError, _parse_push_certificate, lines)
+
+    def test_parse_rejects_missing_end_marker(self) -> None:
+        lines = make_cert_pkt_lines(b"n", [(ONE, TWO, b"refs/heads/master")])
+        self.assertRaises(PushCertificateError, _parse_push_certificate, lines[:-1])
+
+
+class InMemoryNonceStoreTestCase(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._store = InMemoryNonceStore()
+
+    def test_nonce_is_single_use(self) -> None:
+        nonce = self._store.create_nonce()
+        self._store.validate_nonce(nonce)
+        self.assertRaises(PushCertificateError, self._store.validate_nonce, nonce)
+
+    def test_unknown_nonce_rejected(self) -> None:
+        self.assertRaises(
+            PushCertificateError, self._store.validate_nonce, b"never-minted"
+        )
+
+    def test_minted_nonces_are_unique(self) -> None:
+        self.assertNotEqual(self._store.create_nonce(), self._store.create_nonce())
+
+
+class PushCertificateReceiveTestCase(TestCase):
+    """End-to-end checks over the in-memory test protocol."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._old_commit = make_commit(id=ONE, parents=[], commit_time=111)
+        self._new_commit = make_commit(
+            id=TWO, parents=[self._old_commit.id], commit_time=222
+        )
+        self._extra_commit = make_commit(
+            id=THREE, parents=[self._new_commit.id], commit_time=333
+        )
+        self._repo = MemoryRepo.init_bare(
+            [self._old_commit, self._new_commit, self._extra_commit],
+            {b"refs/heads/master": self._old_commit.id},
+        )
+        self._backend = DictBackend({b"/": self._repo})
+        self._nonce_store = InMemoryNonceStore()
+        self._verifier = RecordingVerifier()
+        self._master_command = (ONE, TWO, b"refs/heads/master")
+
+    def _proto(self) -> TestProto:
+        proto = TestProto()
+        # All objects named by the test commands are already in the store;
+        # supply a valid but empty pack for the handler's pack read.
+        pack = BytesIO()
+        write_pack_objects(pack.write, [], object_format=self._repo.object_format)
+        proto.read = BytesIO(pack.getvalue()).read
+        return proto
+
+    def _status_lines(self, proto: TestProto) -> list[bytes]:
+        """Drop the ref advertisement and return report-status lines."""
+        lines = list(proto._received[0])
+        return [
+            line
+            for line in lines
+            if line is not None and line[:2] in (b"un", b"ok", b"ng")
+        ]
+
+    def _handler(self, proto, *, verifier: bool = True) -> ReceivePackHandler:
+        return ReceivePackHandler(
+            self._backend,
+            [b"/"],
+            proto,
+            push_certificate_verifier=self._verifier if verifier else None,
+            nonce_store=self._nonce_store,
+        )
+
+    def _run_cert_push(
+        self,
+        proto,
+        *,
+        nonce: bytes | None = None,
+        cert_commands=None,
+        wire_commands=None,
+        handler: ReceivePackHandler | None = None,
+    ) -> ReceivePackHandler:
+        if handler is None:
+            handler = self._handler(proto)
+        if nonce is None:
+            # Default to the exact nonce minted for this handler's session.
+            assert handler._advertised_nonce is not None
+            nonce = handler._advertised_nonce
+        if cert_commands is None:
+            cert_commands = [self._master_command]
+        if wire_commands is None:
+            wire_commands = [self._master_command]
+        cert_lines = make_cert_pkt_lines(nonce, cert_commands)
+        command_lines = [
+            old + b" " + new + b" " + ref for old, new, ref in wire_commands
+        ]
+        proto.set_output(
+            [
+                command_lines[0] + b"\x00push-cert=0.1 report-status",
+                *command_lines[1:],
+                None,  # delim-pkt ends the command list
+                *cert_lines,
+                None,  # flush-pkt ends the certificate
+            ]
+        )
+        handler.handle()
+        return handler
+
+    def test_capability_advertised_only_with_verifier(self) -> None:
+        handler = self._handler(self._proto())
+        advertised = b" ".join(handler.capabilities())
+        self.assertIn(b"push-cert=nonce ", advertised)
+
+        plain = ReceivePackHandler(self._backend, [b"/"], self._proto())
+        self.assertNotIn(b"push-cert", b" ".join(plain.capabilities()))
+
+    def test_constructor_requires_nonce_store(self) -> None:
+        self.assertRaises(
+            ValueError,
+            ReceivePackHandler,
+            self._backend,
+            [b"/"],
+            self._proto(),
+            push_certificate_verifier=RecordingVerifier(),
+        )
+
+    def test_accepted_certificate_updates_ref(self) -> None:
+        proto = self._proto()
+        self._run_cert_push(proto)
+        self.assertEqual(1, len(self._verifier.calls))
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+        self.assertEqual(
+            [b"unpack ok\n", b"ok refs/heads/master\n"],
+            self._status_lines(proto),
+        )
+
+    def test_rejected_nonce_leaves_refs_untouched(self) -> None:
+        proto = self._proto()
+        self._run_cert_push(proto, nonce=b"stale-or-replayed-nonce")
+        self.assertEqual([], self._verifier.calls)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"nonce", b" ".join(self._status_lines(proto)))
+
+    def test_replay_nonce_leaves_refs_untouched(self) -> None:
+        # First session: a fresh handler mints and redeems its nonce.
+        first_proto = self._proto()
+        first_handler = self._handler(first_proto)
+        reused_nonce = first_handler._advertised_nonce
+        self._run_cert_push(first_proto, handler=first_handler)
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+
+        # Roll the ref back so a second success would be observable.
+        self._repo.refs._update({b"refs/heads/master": ObjectID(ONE)})
+
+        # A second handler gets its own session nonce; replaying the first
+        # certificate (with the old nonce) must be refused.
+        second_proto = self._proto()
+        self._run_cert_push(second_proto, nonce=reused_nonce)
+        self.assertEqual(1, len(self._verifier.calls))
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"nonce", b" ".join(self._status_lines(second_proto)))
+
+    def test_command_mismatch_leaves_refs_untouched(self) -> None:
+        proto = self._proto()
+        self._run_cert_push(
+            proto,
+            cert_commands=[(ONE, THREE, b"refs/heads/master")],
+        )
+        self.assertEqual([], self._verifier.calls)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"do not match", b" ".join(self._status_lines(proto)))
+
+    def test_added_command_detected(self) -> None:
+        proto = self._proto()
+        self._run_cert_push(
+            proto,
+            cert_commands=[
+                self._master_command,
+                (ZERO_SHA, THREE, b"refs/heads/extra"),
+            ],
+        )
+        self.assertEqual([], self._verifier.calls)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+
+    def test_reordered_commands_detected(self) -> None:
+        other_command = (ZERO_SHA, THREE, b"refs/heads/other")
+        proto = self._proto()
+        handler = self._handler(proto)
+        self._run_cert_push(
+            proto,
+            handler=handler,
+            # Certificate signs the two commands in the opposite order.
+            cert_commands=[other_command, self._master_command],
+            wire_commands=[self._master_command, other_command],
+        )
+        self.assertEqual([], self._verifier.calls)
+        self.assertNotIn(b"refs/heads/other", self._repo.refs.allkeys())
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+
+    def test_verifier_failure_leaves_refs_untouched(self) -> None:
+        self._verifier.result = False
+        proto = self._proto()
+        self._run_cert_push(proto)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"not trusted", b" ".join(self._status_lines(proto)))
+
+    def test_verifier_exception_leaves_refs_untouched(self) -> None:
+        self._verifier.raises = RuntimeError("keyring unavailable")
+        proto = self._proto()
+        self._run_cert_push(proto)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"verifier failed", b" ".join(self._status_lines(proto)))
+
+    def test_certificate_without_verifier_is_rejected(self) -> None:
+        # With no verifier wired up the push-cert capability is never
+        # advertised, so a client sending one is a protocol violation and
+        # the push is refused before any ref is touched.
+        nonce = self._nonce_store.create_nonce()
+        proto = self._proto()
+        proto.set_output(
+            [
+                ONE + b" " + TWO + b" refs/heads/master\x00push-cert=0.1 report-status",
+                None,
+                *make_cert_pkt_lines(nonce, [self._master_command]),
+                None,
+            ]
+        )
+        self.assertRaises(GitProtocolError, self._handler(proto, verifier=False).handle)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+
+    def test_certificate_without_verifier_never_advertised(self) -> None:
+        handler = ReceivePackHandler(self._backend, [b"/"], self._proto())
+        self.assertNotIn(b"push-cert", b" ".join(handler.capabilities()))
+
+    def test_unsigned_push_still_works_with_verifier_configured(self) -> None:
+        proto = self._proto()
+        proto.set_output(
+            [
+                ONE + b" " + TWO + b" refs/heads/master\x00report-status",
+                None,
+            ]
+        )
+        self._handler(proto).handle()
+        self.assertEqual([], self._verifier.calls)
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+
+    def test_unsigned_push_still_works_without_verifier(self) -> None:
+        proto = self._proto()
+        proto.set_output(
+            [
+                ONE + b" " + TWO + b" refs/heads/master\x00report-status",
+                None,
+            ]
+        )
+        ReceivePackHandler(self._backend, [b"/"], proto).handle()
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+
+    def test_verifier_runs_before_pre_receive_hook(self) -> None:
+        events: list[str] = []
+
+        class OrderVerifier(RecordingVerifier):
+            def verify(self, certificate) -> bool:
+                events.append("verify")
+                return super().verify(certificate)
+
+        mock_hook = Mock()
+
+        def hook_execute(client_refs):
+            events.append("pre-receive")
+            return (b"", b"")
+
+        mock_hook.execute = hook_execute
+        self._repo.hooks["pre-receive"] = mock_hook
+        self._verifier = OrderVerifier()
+
+        proto = self._proto()
+        self._run_cert_push(proto)
+        self.assertEqual(["verify", "pre-receive"], events)
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+
+    def test_failed_verifier_skips_hooks_and_refs(self) -> None:
+        mock_hook = Mock()
+        self._repo.hooks["pre-receive"] = mock_hook
+        self._verifier.result = False
+        proto = self._proto()
+        self._run_cert_push(proto)
+        mock_hook.execute.assert_not_called()
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+
+    def _real_proto_push(self, nonce: bytes | None = None, *, verifier) -> bytes:
+        # Exercise the genuine packet parser including the delim-pkt (0001)
+        # that separates commands from the certificate.
+        outf = BytesIO()
+        # Build the handler first so it mints the advertised session nonce,
+        # then frame the request around that nonce.
+        handler = ReceivePackHandler(
+            self._backend,
+            [b"/"],
+            Protocol(BytesIO(b"").read, outf.write),
+            push_certificate_verifier=verifier,
+            nonce_store=self._nonce_store,
+        )
+        used_nonce = nonce or handler._advertised_nonce
+        assert used_nonce is not None
+
+        frames = pkt_line(
+            ONE + b" " + TWO + b" refs/heads/master\x00push-cert=0.1 report-status"
+        )
+        frames += b"0001"
+        for line in make_cert_pkt_lines(used_nonce, [self._master_command]):
+            frames += pkt_line(line)
+        frames += b"0000"
+        pack = BytesIO()
+        write_pack_objects(pack.write, [], object_format=self._repo.object_format)
+        frames += pack.getvalue()
+
+        handler.proto = Protocol(BytesIO(frames).read, outf.write)
+        handler.handle()
+        return outf.getvalue()
+
+    def test_real_protocol_accepted_push(self) -> None:
+        verifier = RecordingVerifier()
+        output = self._real_proto_push(verifier=verifier)
+        self.assertEqual(1, len(verifier.calls))
+        self.assertEqual(ObjectID(TWO), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"unpack ok", output)
+
+    def test_real_protocol_foreign_nonce_refused(self) -> None:
+        verifier = RecordingVerifier()
+        output = self._real_proto_push(
+            b"nonce-from-a-different-session", verifier=verifier
+        )
+        self.assertEqual([], verifier.calls)
+        self.assertEqual(ObjectID(ONE), self._repo.refs[b"refs/heads/master"])
+        self.assertIn(b"nonce", output)
 
 
 class ProtocolGraphWalkerEmptyTestCase(TestCase):

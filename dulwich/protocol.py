@@ -42,6 +42,7 @@ __all__ = [
     "CAPABILITY_OBJECT_FORMAT",
     "CAPABILITY_OFS_DELTA",
     "CAPABILITY_PACKFILE_URIS",
+    "CAPABILITY_PUSH_CERT",
     "CAPABILITY_PUSH_OPTIONS",
     "CAPABILITY_QUIET",
     "CAPABILITY_REPORT_STATUS",
@@ -189,6 +190,7 @@ CAPABILITY_FETCH = b"fetch"
 CAPABILITY_FILTER = b"filter"
 CAPABILITY_OBJECT_FORMAT = b"object-format"
 CAPABILITY_PACKFILE_URIS = b"packfile-uris"
+CAPABILITY_PUSH_CERT = b"push-cert"
 CAPABILITY_PUSH_OPTIONS = b"push-options"
 
 # Magic ref that is used to attach capabilities to when

@@ -51,9 +51,14 @@ __all__ = [
     "DictBackend",
     "FileSystemBackend",
     "Handler",
+    "InMemoryNonceStore",
     "MultiAckDetailedGraphWalkerImpl",
     "MultiAckGraphWalkerImpl",
+    "NonceStore",
     "PackHandler",
+    "PushCertificate",
+    "PushCertificateError",
+    "PushCertificateVerifier",
     "ReceivePackHandler",
     "SingleAckGraphWalkerImpl",
     "TCPGitRequestHandler",
@@ -68,14 +73,17 @@ __all__ = [
 ]
 
 import os
+import secrets
 import socket
 import socketserver
 import sys
+import threading
 import time
 import zlib
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
 from functools import partial
 from typing import IO, TYPE_CHECKING
 from typing import Protocol as TypingProtocol
@@ -121,6 +129,7 @@ from .protocol import (
     CAPABILITY_NO_DONE,
     CAPABILITY_NO_PROGRESS,
     CAPABILITY_OFS_DELTA,
+    CAPABILITY_PUSH_CERT,
     CAPABILITY_QUIET,
     CAPABILITY_REPORT_STATUS,
     CAPABILITY_SHALLOW,
@@ -419,6 +428,21 @@ class PackHandler(Handler):
             if cap.startswith(CAPABILITY_FILTER + b"="):
                 # Filter capability can have a value (e.g., filter=blob:none)
                 if CAPABILITY_FILTER not in allowable_caps:
+                    raise GitProtocolError(
+                        f"Client asked for capability {cap!r} that was not advertised."
+                    )
+                continue
+            if (
+                cap.startswith(CAPABILITY_PUSH_CERT + b"=")
+                or cap == CAPABILITY_PUSH_CERT
+            ):
+                # The client echoes push-cert with its own version argument;
+                # only accept it when the server advertised the capability.
+                if not any(
+                    advertised == CAPABILITY_PUSH_CERT
+                    or advertised.startswith(CAPABILITY_PUSH_CERT + b"=")
+                    for advertised in allowable_caps
+                ):
                     raise GitProtocolError(
                         f"Client asked for capability {cap!r} that was not advertised."
                     )
@@ -1411,6 +1435,248 @@ def _is_funny_ref(ref: Ref) -> bool:
     return not ref.startswith(b"refs/") or not check_ref_format(ref)
 
 
+class PushCertificateError(Exception):
+    """A push certificate is malformed or could not be verified.
+
+    Raised when the certificate cannot be parsed, its nonce is unknown or
+    replayed, the signed commands do not match the actual push, or the
+    verifier rejects it.
+    """
+
+
+@dataclass
+class PushCertificate:
+    """A parsed GPG-signed push certificate.
+
+    See Documentation/technical/protocol-v2.txt (``push-cert`` capability)
+    in the Git distribution for the wire format.
+
+    Attributes:
+        cert: Raw bytes covered by the signature, i.e. everything between
+            the ``push-cert`` and ``gpgsig`` pkt-lines joined with newlines
+            and terminated by a trailing newline, exactly as the verifier
+            must check them.
+        commands: The ``(old_sha, new_sha, ref_name)`` update commands
+            carried in the signed ``pushee`` section, in order.
+        nonce: Value of the signed ``nonce`` header.
+        signature: Detached ASCII-armored GPG signature, without the
+            surrounding ``gpgsig`` / ``end-cert`` markers.
+        headers: Remaining signed header lines (``key value``), in order.
+        push_options: Push options transmitted after ``end-cert``, if any.
+    """
+
+    cert: bytes
+    commands: list[tuple[ObjectID, ObjectID, Ref]]
+    nonce: bytes
+    signature: bytes
+    headers: list[tuple[bytes, bytes]] = field(default_factory=list)
+    push_options: list[bytes] = field(default_factory=list)
+
+
+def _parse_push_certificate(pkt_lines: Sequence[bytes]) -> PushCertificate:
+    """Parse the pkt-lines of a client push certificate.
+
+    Args:
+        pkt_lines: pkt-line contents received between the client's
+            ``push-cert <version>`` line and the flush-pkt that terminates
+            the command stream.
+
+    Returns:
+        The parsed push certificate.
+
+    Raises:
+        PushCertificateError: If the framing or any signed line is invalid.
+    """
+    header_prefix = b"certificate version "
+    sig_prefix = b"gpgsig "
+    end_marker = b"end-cert"
+
+    idx = 0
+    if idx >= len(pkt_lines) or not pkt_lines[idx].startswith(header_prefix):
+        raise PushCertificateError("push certificate missing 'certificate' header")
+    version_line = pkt_lines[idx].rstrip(b"\n")
+    version = pkt_lines[idx][len(header_prefix) :].strip()
+    if version != b"0.1":
+        raise PushCertificateError(f"unsupported push certificate version {version!r}")
+    idx += 1
+
+    # Everything from the version line up to "gpgsig" is covered by the
+    # signature, exactly as the verifier must see it.
+    signed_lines: list[bytes] = [version_line]
+    headers: list[tuple[bytes, bytes]] = []
+    nonce: bytes | None = None
+    while idx < len(pkt_lines):
+        line = pkt_lines[idx]
+        idx += 1
+        if line.startswith(sig_prefix):
+            break
+        stripped = line.rstrip(b"\n")
+        if stripped == b"pushee":
+            signed_lines.append(stripped)
+            break
+        key, sep, value = stripped.partition(b" ")
+        if not sep:
+            raise PushCertificateError(
+                f"malformed push certificate header line: {stripped!r}"
+            )
+        signed_lines.append(stripped)
+        headers.append((key, value))
+        if key == b"nonce":
+            nonce = value
+    else:
+        raise PushCertificateError("push certificate missing 'gpgsig' marker")
+
+    if nonce is None:
+        raise PushCertificateError("push certificate is missing a nonce")
+
+    commands: list[tuple[ObjectID, ObjectID, Ref]] = []
+    while idx < len(pkt_lines):
+        line = pkt_lines[idx]
+        if line.startswith(sig_prefix):
+            break
+        idx += 1
+        stripped = line.rstrip(b"\n")
+        if not stripped:
+            raise PushCertificateError("empty line in push certificate command list")
+        try:
+            old_sha, new_sha, ref_name = stripped.split(b" ")
+        except ValueError as exc:
+            raise PushCertificateError(
+                f"malformed push certificate command: {stripped!r}"
+            ) from exc
+        if not valid_hexsha(old_sha) or not valid_hexsha(new_sha):
+            raise PushCertificateError(
+                f"invalid object id in push certificate command: {stripped!r}"
+            )
+        commands.append((ObjectID(old_sha), ObjectID(new_sha), Ref(ref_name)))
+        signed_lines.append(stripped)
+    else:
+        raise PushCertificateError("push certificate missing 'gpgsig' marker")
+
+    signature_lines: list[bytes] = []
+    while idx < len(pkt_lines):
+        line = pkt_lines[idx]
+        idx += 1
+        if line.strip() == end_marker:
+            break
+        if not line.startswith(sig_prefix):
+            raise PushCertificateError(
+                f"malformed push certificate signature line: {line!r}"
+            )
+        signature_lines.append(line[len(sig_prefix) :].rstrip(b"\n"))
+    else:
+        raise PushCertificateError("push certificate missing 'end-cert' marker")
+
+    push_options = [line.rstrip(b"\n") for line in pkt_lines[idx:]]
+
+    cert = b"".join(line + b"\n" for line in signed_lines)
+    signature = b"\n".join(signature_lines) + (b"\n" if signature_lines else b"")
+    return PushCertificate(
+        cert=cert,
+        commands=commands,
+        nonce=nonce,
+        signature=signature,
+        headers=headers,
+        push_options=push_options,
+    )
+
+
+class PushCertificateVerifier(TypingProtocol):
+    """Verifier for the cryptographic signature of a push certificate.
+
+    Implementations are supplied by the service hosting the server; Dulwich
+    itself does not trust any particular key or signer. ``verify`` is called
+    with the exact signed bytes and the detached signature, and must raise
+    (or return ``False``) when the signature does not validate.
+    """
+
+    def verify(
+        self,
+        certificate: PushCertificate,
+    ) -> bool:
+        """Check the signature on a push certificate.
+
+        Args:
+            certificate: Parsed push certificate; ``cert`` holds the exact
+                bytes covered by ``signature``.
+
+        Returns:
+            ``True`` if the signature is valid for a trusted signer.
+
+        Raises:
+            PushCertificateError: On any failure; any other exception is
+                treated as a failure as well.
+        """
+        raise NotImplementedError
+
+
+class NonceStore(TypingProtocol):
+    """Store that mints push nonces and rejects unknown or replayed ones.
+
+    A nonce is advertised in the ``push-cert`` capability and must appear
+    unchanged in the signed certificate header. Each minted nonce may be
+    redeemed at most once.
+    """
+
+    def create_nonce(self) -> bytes:
+        """Mint a fresh, single-use nonce."""
+        raise NotImplementedError
+
+    def validate_nonce(self, nonce: bytes) -> None:
+        """Validate and consume a nonce.
+
+        Args:
+            nonce: The nonce claimed by the client certificate.
+
+        Raises:
+            PushCertificateError: If the nonce was never minted or has
+                already been redeemed.
+        """
+        raise NotImplementedError
+
+
+class InMemoryNonceStore:
+    """Thread-safe nonce store that keeps state in memory.
+
+    Suitable for tests and for single-process servers. Multi-process
+    deployments need a shared implementation instead.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty store."""
+        self._nonces: set[bytes] = set()
+        self._lock = threading.Lock()
+
+    def create_nonce(self) -> bytes:
+        """Mint a fresh, single-use nonce and remember it.
+
+        Returns:
+            A URL-safe random nonce token.
+        """
+        nonce = secrets.token_urlsafe(32).encode("ascii")
+        with self._lock:
+            self._nonces.add(nonce)
+        return nonce
+
+    def validate_nonce(self, nonce: bytes) -> None:
+        """Consume a nonce, refusing unknown or replayed values.
+
+        Args:
+            nonce: The nonce claimed by the client certificate.
+
+        Raises:
+            PushCertificateError: If the nonce is unknown or was already
+                used.
+        """
+        with self._lock:
+            try:
+                self._nonces.remove(nonce)
+            except KeyError as exc:
+                raise PushCertificateError(
+                    "push certificate nonce is invalid or has already been used"
+                ) from exc
+
+
 class ReceivePackHandler(PackHandler):
     """Protocol handler for downloading a pack from the client."""
 
@@ -1421,6 +1687,8 @@ class ReceivePackHandler(PackHandler):
         proto: Protocol,
         stateless_rpc: bool = False,
         advertise_refs: bool = False,
+        push_certificate_verifier: PushCertificateVerifier | None = None,
+        nonce_store: NonceStore | None = None,
     ) -> None:
         """Initialize receive-pack handler.
 
@@ -1430,10 +1698,29 @@ class ReceivePackHandler(PackHandler):
             proto: Protocol instance
             stateless_rpc: Whether to use stateless RPC
             advertise_refs: Whether to advertise refs
+            push_certificate_verifier: Verifier used to validate the
+                signature on push certificates. Push certificates are only
+                accepted when a verifier is configured; certificates sent
+                without one are always rejected.
+            nonce_store: Store used to mint and redeem single-use nonces.
+                Required when ``push_certificate_verifier`` is set.
         """
         super().__init__(backend, proto, stateless_rpc=stateless_rpc)
         self.repo = backend.open_repository(args[0])
         self.advertise_refs = advertise_refs
+        self._push_certificate_verifier = push_certificate_verifier
+        self._nonce_store = nonce_store
+        self._push_certificate: PushCertificate | None = None
+        self._advertised_nonce: bytes | None = None
+        if push_certificate_verifier is not None:
+            if nonce_store is None:
+                raise ValueError(
+                    "a nonce_store is required when a push certificate "
+                    "verifier is configured"
+                )
+            # One nonce per receive-pack session, advertised once and
+            # redeemed at most once.
+            self._advertised_nonce = nonce_store.create_nonce()
 
     def capabilities(self) -> Iterable[bytes]:
         """Return supported capabilities.
@@ -1441,7 +1728,7 @@ class ReceivePackHandler(PackHandler):
         Returns:
             List of capability names including object-format for the repository
         """
-        return [
+        capabilities = [
             CAPABILITY_REPORT_STATUS,
             CAPABILITY_DELETE_REFS,
             CAPABILITY_QUIET,
@@ -1451,6 +1738,11 @@ class ReceivePackHandler(PackHandler):
             CAPABILITY_NO_DONE,
             capability_object_format(self.repo.object_format.name),
         ]
+        if self._advertised_nonce is not None:
+            capabilities.append(
+                CAPABILITY_PUSH_CERT + b"=nonce " + self._advertised_nonce
+            )
+        return capabilities
 
     def _receive_max_input_size(self) -> int | None:
         """Return the configured ``receive.maxInputSize`` for this repo.
@@ -1728,6 +2020,110 @@ class ReceivePackHandler(PackHandler):
         except HookError as err:
             self.proto.write_sideband(SIDE_BAND_CHANNEL_FATAL, str(err).encode("utf-8"))
 
+    def _read_push_certificate(
+        self, client_refs: list[tuple[ObjectID, ObjectID, Ref]]
+    ) -> PushCertificate | None:
+        """Read and verify a client push certificate, if one was sent.
+
+        The certificate pkt-lines are read up to the flush-pkt that ends
+        the command stream; any subsequent push options are stashed on the
+        parsed certificate.
+
+        Args:
+            client_refs: The ref update commands read from the command
+                stream, which the signed commands must match exactly.
+
+        Returns:
+            The verified push certificate, or ``None`` when the client did
+            not request the ``push-cert`` capability.
+
+        Raises:
+            PushCertificateError: If a certificate is expected but missing
+                or malformed, its nonce is unknown or replayed, its signed
+                commands do not match ``client_refs``, or the verifier
+                rejects it or raises.
+            GitProtocolError: If the client requests an unsupported
+                certificate version.
+        """
+        client_caps = self._client_capabilities or set()
+        push_cert_caps = [
+            cap
+            for cap in client_caps
+            if cap == CAPABILITY_PUSH_CERT
+            or cap.startswith(CAPABILITY_PUSH_CERT + b"=")
+        ]
+        if not push_cert_caps:
+            return None
+
+        if self._push_certificate_verifier is None:
+            # Never accept certificates when no trusted verifier was wired up.
+            raise PushCertificateError(
+                "push certificate received but no verifier is configured"
+            )
+
+        spec = push_cert_caps[0]
+        if b"=" in spec:
+            _, _, version = spec.partition(b"=")
+        else:
+            version = b""
+        if version.strip() != b"0.1":
+            raise GitProtocolError(f"unsupported push certificate version {version!r}")
+
+        pkt_lines = list(self.proto.read_pkt_seq())
+        if not pkt_lines:
+            raise PushCertificateError("push certificate is empty")
+        certificate = _parse_push_certificate(pkt_lines)
+
+        # The signed nonce must be the one advertised for this session.
+        if certificate.nonce != self._advertised_nonce:
+            raise PushCertificateError(
+                "push certificate nonce does not match this session"
+            )
+        if self._nonce_store is None:
+            # Constructor guarantees this when a verifier is configured.
+            raise PushCertificateError("no nonce store is configured")
+        # Single-use redemption rejects replays of an otherwise valid nonce.
+        self._nonce_store.validate_nonce(certificate.nonce)
+
+        if certificate.commands != client_refs:
+            raise PushCertificateError(
+                "push certificate commands do not match the ref update "
+                "commands sent in this session"
+            )
+
+        try:
+            accepted = self._push_certificate_verifier.verify(certificate)
+        except PushCertificateError:
+            raise
+        except Exception as exc:
+            raise PushCertificateError(
+                f"push certificate verifier failed: {exc}"
+            ) from exc
+        if not accepted:
+            raise PushCertificateError("push certificate signature is not trusted")
+        return certificate
+
+    def _fail_push_certificate(
+        self,
+        client_refs: list[tuple[ObjectID, ObjectID, Ref]],
+        message: bytes,
+    ) -> None:
+        """Report a failed certificate to the client without touching refs.
+
+        Args:
+            client_refs: Ref updates named in the failed push.
+            message: Status message sent back for the unpack step and refs.
+        """
+        if self.has_capability(CAPABILITY_REPORT_STATUS):
+            status = [(b"unpack", message)]
+            for _, _, ref_name in client_refs:
+                status.append((ref_name, message))
+            # _report_status already frames output over the side-band channel
+            # when side-band-64k is in use.
+            self._report_status(status)
+        elif self.has_capability(CAPABILITY_SIDE_BAND_64K):
+            self.proto.write_sideband(SIDE_BAND_CHANNEL_FATAL, message + b"\n")
+
     def handle(self) -> None:
         """Handle receive-pack request."""
         if self.advertise_refs or not self.stateless_rpc:
@@ -1763,7 +2159,10 @@ class ReceivePackHandler(PackHandler):
         ref_line, caps = extract_capabilities(ref_line)
         self.set_client_capabilities(caps)
 
-        # client will now send us a list of (oldsha, newsha, ref)
+        # A client using push-cert terminates the plain command list with a
+        # delim-pkt (read_pkt_line returns None) rather than a flush-pkt; the
+        # certificate pkt-lines follow and end with a flush-pkt. Without
+        # push-cert, None here is the flush-pkt ending the command list.
         while ref_line:
             try:
                 (oldsha, newsha, ref_name) = ref_line.rstrip(b"\n").split(b" ")
@@ -1777,6 +2176,17 @@ class ReceivePackHandler(PackHandler):
                 )
             client_refs.append((ObjectID(oldsha), ObjectID(newsha), Ref(ref_name)))
             ref_line = self.proto.read_pkt_line()
+
+        # Verify the signed certificate, if any, before anything can mutate
+        # the repository. Replay, command mismatch and verifier failures all
+        # abort the push while refs are still untouched.
+        try:
+            self._push_certificate = self._read_push_certificate(client_refs)
+        except PushCertificateError as err:
+            message = str(err).replace("\n", " ").encode("utf-8")
+            logger.warning("Rejecting push certificate: %s", message)
+            self._fail_push_certificate(client_refs, message)
+            return
 
         # Run pre-receive hook before processing the pack
         # If it fails, we abort the entire push
