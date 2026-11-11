@@ -62,6 +62,7 @@ from dulwich.pack import (
     create_delta,
     deltify_pack_objects,
     load_pack_index,
+    obj_sha,
     read_zlib_chunks,
     unpack_object,
     unpack_object_at,
@@ -1253,6 +1254,230 @@ class ResolveObjectDeltaCycleTests(TestCase):
         pack = Pack.from_objects(data, index)
         self.addCleanup(pack.close)
         self.assertRaises(DeltaCycle, pack.get_raw, sha_a)
+
+
+class DeltaBaseReuseCacheTests(TestCase):
+    """Tests for the bounded, verified delta-base reuse caches."""
+
+    def _make_shared_base_pack(self, fanout=4, depth=2):
+        # One full base plus `fanout` OFS_DELTA chains of `depth` sharing it.
+        base = b"base-object-" + b"x" * 200
+        specs: list = [(Blob.type_num, base)]
+        payloads = [base]
+        version = 1
+        for _chain in range(fanout):
+            parent_idx = 0
+            for _level in range(depth):
+                payload = f"v{version:04d}-".encode() + base
+                specs.append((OFS_DELTA, (parent_idx, payload)))
+                payloads.append(payload)
+                parent_idx = len(payloads) - 1
+                version += 1
+        f = BytesIO()
+        entries = build_pack(f, specs)
+        data = PackData(
+            "reuse.pack", file=f, object_format=DEFAULT_OBJECT_FORMAT
+        )
+        self.addCleanup(data.close)
+        index = MemoryPackIndex.for_pack(data)
+        pack = Pack.from_objects(data, index)
+        self.addCleanup(pack.close)
+        return pack, entries, payloads
+
+    def test_shared_base_inflated_once(self) -> None:
+        pack, entries, _payloads = self._make_shared_base_pack(fanout=8, depth=1)
+        inflations = {"n": 0}
+        original = pack.data.get_unpacked_object_at
+
+        def counting_unpacked(offset, include_comp=False):
+            inflations["n"] += 1
+            return original(offset, include_comp=include_comp)
+
+        pack.data.get_unpacked_object_at = counting_unpacked  # type: ignore[method-assign]
+        expected = {entry[3]: (Blob.type_num, entry[2]) for entry in entries}
+        for sha, want in expected.items():
+            self.assertEqual(want, pack.get_raw(sha))
+        # Base + each delta once: no object is inflated twice even though all
+        # eight leaves share the same base.
+        self.assertEqual(len(entries), inflations["n"])
+
+    def test_resolved_objects_cached_and_reused(self) -> None:
+        pack, entries, _payloads = self._make_shared_base_pack(fanout=4, depth=2)
+        first = entries[-1][3]
+        self.assertEqual((Blob.type_num, entries[-1][2]), pack.get_raw(first))
+        # The resolved leaf is now in the reusable cache under its offset.
+        self.assertIn(entries[-1][0], pack.data._resolved_cache._cache)
+        # A second read is served entirely from the cache (no inflation).
+        inflations = {"n": 0}
+        original = pack.data.get_unpacked_object_at
+
+        def counting_unpacked(offset, include_comp=False):
+            inflations["n"] += 1
+            return original(offset, include_comp=include_comp)
+
+        pack.data.get_unpacked_object_at = counting_unpacked  # type: ignore[method-assign]
+        self.assertEqual((Blob.type_num, entries[-1][2]), pack.get_raw(first))
+        self.assertEqual(0, inflations["n"])
+
+    def test_every_object_matches_payload_and_oid(self) -> None:
+        pack, entries, _payloads = self._make_shared_base_pack(fanout=6, depth=3)
+        for _offset, type_num, data, sha, _crc in entries:
+            got_type, got_raw = pack.get_raw(sha)
+            self.assertEqual(type_num, got_type)
+            self.assertEqual(data, got_raw)
+            self.assertEqual(sha, obj_sha(got_type, [got_raw]))
+
+    def test_caches_are_byte_bounded(self) -> None:
+        limit = 2048
+        f = BytesIO()
+        specs = [(Blob.type_num, b"blob-0" * 128)]
+        for i in range(1, 24):
+            specs.append((OFS_DELTA, (0, f"blob-{i}".encode() * 128)))
+        build_pack(f, specs)
+        data = PackData(
+            "bounded.pack",
+            file=f,
+            object_format=DEFAULT_OBJECT_FORMAT,
+            delta_base_cache_limit=limit,
+        )
+        self.addCleanup(data.close)
+        index = MemoryPackIndex.for_pack(data)
+        pack = Pack.from_objects(data, index)
+        self.addCleanup(pack.close)
+        for sha, _offset, _crc in index.iterentries():
+            pack.get_raw(sha)
+        self.assertLessEqual(data._resolved_cache._value_size, limit)
+        self.assertLessEqual(data._offset_cache._value_size, limit)
+        self.assertLessEqual(
+            pack._ext_base_cache._value_size, pack._ext_base_cache._max_size
+        )
+
+    def test_bad_delta_never_cached(self) -> None:
+        base = b"x" * 64
+        sha_base = obj_sha(Blob.type_num, [base])
+
+        def size_enc(n):
+            out = [n & 0x7F]
+            n >>= 7
+            while n:
+                out.insert(0, 0x80 | (n & 0x7F))
+                n >>= 7
+            return bytes(out)
+
+        # Valid size headers followed by an invalid copy opcode.
+        bad_delta = [size_enc(len(base)) + size_enc(64) + b"\x80"]
+        buf = BytesIO()
+        write_pack_header(buf.write, 2)
+        write_pack_object(
+            buf.write, Blob.type_num, [base], object_format=DEFAULT_OBJECT_FORMAT
+        )
+        leaf_offset = buf.tell()
+        write_pack_object(
+            buf.write, REF_DELTA, (sha_base, bad_delta),
+            object_format=DEFAULT_OBJECT_FORMAT,
+        )
+        body = buf.getvalue()
+        raw = body + sha1(body).digest()
+
+        data = PackData(
+            "bad.pack", file=BytesIO(raw), object_format=DEFAULT_OBJECT_FORMAT
+        )
+        self.addCleanup(data.close)
+        index = MemoryPackIndex(
+            [(sha_base, 12, 0), (b"\xab" * 20, leaf_offset, 0)],
+            DEFAULT_OBJECT_FORMAT,
+            pack_checksum=raw[-20:],
+        )
+        pack = Pack.from_objects(data, index)
+        self.addCleanup(pack.close)
+        pack.resolve_ext_ref = lambda sha: (Blob.type_num, base)
+        self.assertRaises(ApplyDeltaError, pack.get_raw, b"\xab" * 20)
+        self.assertNotIn(leaf_offset, data._resolved_cache._cache)
+        self.assertEqual(0, data._resolved_cache._value_size)
+
+    def test_checksum_failure_never_cached(self) -> None:
+        base = b"base" * 32
+        good = base + b"-new"
+        sha_base = obj_sha(Blob.type_num, [base])
+        wrong_leaf_sha = b"\xcd" * 20
+        delta = list(create_delta(base, good))
+
+        buf = BytesIO()
+        write_pack_header(buf.write, 2)
+        write_pack_object(
+            buf.write, Blob.type_num, [base], object_format=DEFAULT_OBJECT_FORMAT
+        )
+        leaf_offset = buf.tell()
+        write_pack_object(
+            buf.write, REF_DELTA, (sha_base, delta),
+            object_format=DEFAULT_OBJECT_FORMAT,
+        )
+        body = buf.getvalue()
+        raw = body + sha1(body).digest()
+
+        data = PackData(
+            "csum.pack", file=BytesIO(raw), object_format=DEFAULT_OBJECT_FORMAT
+        )
+        self.addCleanup(data.close)
+        index = MemoryPackIndex(
+            [(sha_base, 12, 0), (wrong_leaf_sha, leaf_offset, 0)],
+            DEFAULT_OBJECT_FORMAT,
+            pack_checksum=raw[-20:],
+        )
+        pack = Pack.from_objects(data, index)
+        self.addCleanup(pack.close)
+        pack.verify_resolved = True
+        pack.resolve_ext_ref = lambda sha: (Blob.type_num, base)
+        self.assertRaises(ChecksumMismatch, pack.get_raw, wrong_leaf_sha)
+        self.assertNotIn(leaf_offset, data._resolved_cache._cache)
+
+    def test_external_base_read_once_for_thin_pack(self) -> None:
+        base = b"external-base" * 24
+        leaf_a = base + b"-A"
+        leaf_b = base + b"-B"
+        sha_base = obj_sha(Blob.type_num, [base])
+        sha_a = obj_sha(Blob.type_num, [leaf_a])
+        sha_b = obj_sha(Blob.type_num, [leaf_b])
+
+        buf = BytesIO()
+        write_pack_header(buf.write, 2)
+        offset_a = buf.tell()
+        write_pack_object(
+            buf.write, REF_DELTA, (sha_base, list(create_delta(base, leaf_a))),
+            object_format=DEFAULT_OBJECT_FORMAT,
+        )
+        offset_b = buf.tell()
+        write_pack_object(
+            buf.write, REF_DELTA, (sha_base, list(create_delta(base, leaf_b))),
+            object_format=DEFAULT_OBJECT_FORMAT,
+        )
+        body = buf.getvalue()
+        raw = body + sha1(body).digest()
+
+        data = PackData(
+            "thin.pack", file=BytesIO(raw), object_format=DEFAULT_OBJECT_FORMAT
+        )
+        self.addCleanup(data.close)
+        index = MemoryPackIndex(
+            [(sha_a, offset_a, 0), (sha_b, offset_b, 0)],
+            DEFAULT_OBJECT_FORMAT,
+            pack_checksum=raw[-20:],
+        )
+        pack = Pack.from_objects(data, index)
+        self.addCleanup(pack.close)
+        reads = {"n": 0}
+
+        def resolve_ext_ref(sha):
+            reads["n"] += 1
+            return Blob.type_num, base
+
+        pack.resolve_ext_ref = resolve_ext_ref
+        self.assertEqual((Blob.type_num, leaf_a), pack.get_raw(sha_a))
+        self.assertEqual((Blob.type_num, leaf_b), pack.get_raw(sha_b))
+        # Both leaves name the same external base: it is fetched once.
+        self.assertEqual(1, reads["n"])
+        self.assertEqual((Blob.type_num, leaf_a), pack.get_raw(sha_a))
+        self.assertEqual(1, reads["n"])
 
 
 class WritePackTests(TestCase):

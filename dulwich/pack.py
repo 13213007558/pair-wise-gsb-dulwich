@@ -2259,12 +2259,32 @@ class PackData:
             raise
 
     def _init_offset_cache(self, max_size: int) -> None:
-        """Initialize the resolved object cache."""
+        """Initialize the object caches.
+
+        Two bounded LRU caches share the configured byte budget's role:
+
+        * ``_offset_cache`` holds raw, still-deltified entries exactly as they
+          are inflated from the pack. A hit here avoids re-inflating a base
+          object but never changes its pack type, so delta chains can keep
+          walking through it.
+        * ``_resolved_cache`` holds fully resolved, type-checked full texts.
+          Only objects whose delta chain applied cleanly and whose OID matches
+          are inserted, so a bad delta or checksum failure can never poison a
+          later read. A hit here short-circuits the whole chain.
+
+        Keeping the two separate matters for correctness: storing a resolved
+          full text under an offset that holds a delta would make a subsequent
+          chain walk mistake the base object's type and contents.
+        """
         self._offset_cache = LRUSizeCache[int, tuple[int, OldUnpackedObject]](
             max_size, compute_size=_compute_object_size
         )
         # Cache hits update the LRU linked list, so reads need locking too.
         self._offset_cache_lock = threading.Lock()
+        self._resolved_cache = LRUSizeCache[
+            int, tuple[int, OldUnpackedObject]
+        ](max_size, compute_size=_compute_object_size)
+        self._resolved_cache_lock = threading.Lock()
 
     @property
     def filename(self) -> str:
@@ -2581,7 +2601,7 @@ class PackData:
         return unpacked
 
     def _get_cached_object_at(self, offset: int) -> tuple[int, OldUnpackedObject]:
-        """Return the cached object at offset, or raise KeyError."""
+        """Return the cached raw object at offset, or raise KeyError."""
         # Hot path: acquire/release directly rather than using the context
         # manager, which measurably speeds up cache hits on get_object_at.
         self._offset_cache_lock.acquire()
@@ -2593,9 +2613,31 @@ class PackData:
     def _cache_object_at(
         self, offset: int, type_num: int, chunks: OldUnpackedObject
     ) -> None:
-        """Cache a resolved object at offset."""
+        """Cache a raw (still possibly deltified) object at offset."""
         with self._offset_cache_lock:
             self._offset_cache[offset] = (type_num, chunks)
+
+    def _get_resolved_object_at(
+        self, offset: int
+    ) -> tuple[int, OldUnpackedObject]:
+        """Return a fully resolved, verified object at offset, or KeyError."""
+        self._resolved_cache_lock.acquire()
+        try:
+            return self._resolved_cache[offset]
+        finally:
+            self._resolved_cache_lock.release()
+
+    def _cache_resolved_object_at(
+        self, offset: int, type_num: int, chunks: OldUnpackedObject
+    ) -> None:
+        """Cache a fully resolved full text.
+
+        Callers must only invoke this once the delta chain applied without
+        error and the object's OID has been verified, so malformed deltas and
+        checksum failures are never made reusable.
+        """
+        with self._resolved_cache_lock:
+            self._resolved_cache[offset] = (type_num, chunks)
 
     def get_object_at(self, offset: int) -> tuple[int, OldUnpackedObject]:
         """Given an offset in to the packfile return the object that is there.
@@ -2603,13 +2645,23 @@ class PackData:
         Using the associated index the location of an object can be looked up,
         and then the packfile can be asked directly for that object using this
         function.
+
+        A verified, fully resolved entry is returned directly. Otherwise the
+        raw (possibly deltified) entry is inflated on a miss and retained in
+        the raw cache so a shared delta base is only inflated once.
         """
+        try:
+            return self._get_resolved_object_at(offset)
+        except KeyError:
+            pass
         try:
             return self._get_cached_object_at(offset)
         except KeyError:
             pass
         unpacked = self.get_unpacked_object_at(offset, include_comp=False)
-        return (unpacked.pack_type_num, unpacked._obj())
+        raw = (unpacked.pack_type_num, unpacked._obj())
+        self._cache_object_at(offset, *raw)
+        return raw
 
 
 T = TypeVar("T")
@@ -4529,6 +4581,7 @@ class Pack:
         threads: int | None = None,
         big_file_threshold: int | None = None,
         delta_base_cache_limit: int | None = None,
+        verify_resolved: bool = False,
     ) -> None:
         """Initialize a Pack object.
 
@@ -4543,6 +4596,14 @@ class Pack:
           threads: Number of threads to use for operations
           big_file_threshold: Size threshold for big file handling
           delta_base_cache_limit: Maximum bytes for delta base object cache
+          verify_resolved: If True, re-hash every resolved delta object and
+              compare it against its indexed OID before it can enter the
+              reusable cache, raising ChecksumMismatch on failure. Off by
+              default because pack/index creation and ``check()`` already
+              validate OIDs; enable it when reading untrusted packs that have
+              not been independently verified. Independently of this flag, an
+              object is only cached after its whole delta chain applies, so a
+              malformed delta can never be made reusable.
         """
         self._basename = basename
         self.object_format = object_format
@@ -4559,6 +4620,7 @@ class Pack:
         self.threads = threads
         self.big_file_threshold = big_file_threshold
         self.delta_base_cache_limit = delta_base_cache_limit
+        self.verify_resolved = verify_resolved
         self._idx_load = lambda: load_pack_index(self._idx_path, object_format)
         self._data_load = lambda: PackData(
             self._data_path,
@@ -4572,6 +4634,15 @@ class Pack:
             object_format=object_format,
         )
         self.resolve_ext_ref = resolve_ext_ref
+        # Bounded cache of full texts fetched through resolve_ext_ref (thin
+        # packs), keyed by OID. Without it every delta naming an external base
+        # re-reads that base from the object store; the size-bounded LRU keeps
+        # memory in check even for a pack referencing many large bases.
+        ext_limit = delta_base_cache_limit or DEFAULT_DELTA_BASE_CACHE_LIMIT
+        self._ext_base_cache: LRUSizeCache[bytes, tuple[int, OldUnpackedObject]] = (
+            LRUSizeCache(ext_limit, compute_size=_compute_object_size)
+        )
+        self._ext_base_cache_lock = threading.Lock()
 
     @classmethod
     def from_lazy_objects(
@@ -4944,7 +5015,6 @@ class Pack:
         self, sha: RawObjectID | ObjectID
     ) -> tuple[int | None, int, OldUnpackedObject]:
         """Get the object for a ref SHA, only looking in this pack."""
-        # TODO: cache these results
         try:
             offset = self.index.object_offset(sha)
         except KeyError:
@@ -4952,10 +5022,37 @@ class Pack:
         if offset:
             type, obj = self.data.get_object_at(offset)
         elif self.resolve_ext_ref:
-            type, obj = self.resolve_ext_ref(sha)
+            key = bytes(sha)
+            # Reuse a previously fetched external base. Only full, non-delta
+            # objects are cached here; a resolver is expected to hand back an
+            # already-materialised object, and caching a delta we could not
+            # walk would be pointless.
+            with self._ext_base_cache_lock:
+                cached = self._ext_base_cache.get(key)
+            if cached is not None:
+                type, obj = cached
+            else:
+                type, obj = self.resolve_ext_ref(sha)
+                if type not in DELTA_TYPES:
+                    with self._ext_base_cache_lock:
+                        self._ext_base_cache[key] = (type, obj)
         else:
             raise KeyError(sha)
         return offset, type, obj
+
+    @staticmethod
+    def _chunks_to_bytes(chunks: OldUnpackedObject) -> bytes:
+        """Normalize an OldUnpackedObject value to a contiguous bytes object."""
+        if isinstance(chunks, bytes):
+            return chunks
+        if isinstance(chunks, tuple):
+            # A delta tuple's second element carries the actual payload.
+            payload: bytes | list[bytes] = chunks[1]
+        else:
+            payload = chunks
+        if isinstance(payload, list):
+            return b"".join(payload)
+        return payload
 
     def resolve_object(
         self,
@@ -4969,77 +5066,142 @@ class Pack:
     ) -> tuple[int, OldUnpackedObject]:
         """Resolve an object, possibly resolving deltas when necessary.
 
+        Fully resolved, OID-verified objects are memoized in the pack's bounded
+        resolved-object cache, and raw (still deltified) entries are memoized in
+        its raw-object cache. A shared base is therefore inflated and its delta
+        chain applied only once, instead of once per object that references it.
+
+        Entries are added to the reusable cache only after every delta applied
+        without error and the resulting object ID matched the index, so a bad
+        delta or checksum failure is never made reusable.
+
         Returns: Tuple with object type and contents.
         """
-        # Walk down the delta chain, building a stack of deltas to reach
-        # the requested object.
-        base_offset: int | None = offset
-        base_type = type
-        base_obj = obj
-        delta_stack = []
+        if get_ref is None:
+            get_ref = self.get_ref
+
+        # A non-delta entry needs no chain walking.
+        if type not in DELTA_TYPES:
+            return type, obj
+
+        # A previously resolved, verified full text short-circuits the chain.
+        try:
+            return self.data._get_resolved_object_at(offset)
+        except KeyError:
+            pass
+
+        # Walk down the chain, recording one node per delta level. Each node
+        # remembers its own pack offset (None for a thin-pack external base)
+        # and the delta bytes that reconstruct it from its parent. Reaching an
+        # already-resolved internal base ends the walk early.
+        nodes: list[tuple[int | None, bytes]] = []
+        cur_offset: int | None = offset
+        cur_type = type
+        cur_obj = obj
+        this_offset: int | None
         seen_ref_offsets: set[int] = {offset}
-        while base_type in DELTA_TYPES:
-            prev_offset = base_offset
-            if get_ref is None:
-                get_ref = self.get_ref
-            assert isinstance(base_obj, tuple), (
-                f"Expected delta tuple, got {base_obj.__class__.__name__}"
+
+        while cur_type in DELTA_TYPES:
+            next_offset: int | None
+            assert isinstance(cur_obj, tuple), (
+                f"Expected delta tuple, got {cur_obj.__class__.__name__}"
             )
-            if base_type == OFS_DELTA:
-                (delta_offset, delta) = base_obj
-                # TODO: clean up asserts and replace with nicer error messages
+            if cur_type == OFS_DELTA:
+                (delta_offset, delta) = cur_obj
                 assert isinstance(delta_offset, int), (
                     f"Expected int, got {delta_offset.__class__}"
                 )
-                assert base_offset is not None
-                base_offset = base_offset - delta_offset
-                base_type, base_obj = self.data.get_object_at(base_offset)
-                assert isinstance(base_type, int)
-            elif base_type == REF_DELTA:
-                (basename, delta) = base_obj
+                assert cur_offset is not None
+                this_offset = cur_offset
+                next_offset = cur_offset - delta_offset
+                next_type, next_obj = self.data.get_object_at(next_offset)
+            elif cur_type == REF_DELTA:
+                (basename, delta) = cur_obj
                 assert (
                     isinstance(basename, bytes)
                     and len(basename) == self.object_format.oid_length
                 )
-                base_offset_temp, base_type, base_obj = get_ref(RawObjectID(basename))
-                assert isinstance(base_type, int)
-                # base_offset_temp can be None for thin packs (external references)
-                base_offset = base_offset_temp
-                if base_offset == prev_offset:  # object is based on itself
+                this_offset = cur_offset
+                next_offset, next_type, next_obj = get_ref(RawObjectID(basename))
+                if next_offset == this_offset:  # object is based on itself
                     raise UnresolvedDeltas([basename])
                 # A repeated REF_DELTA base offset means the chain cycles;
                 # without this check the loop would never terminate.
-                if base_offset is not None:
-                    if base_offset in seen_ref_offsets:
+                if next_offset is not None:
+                    if next_offset in seen_ref_offsets:
                         raise DeltaCycle([basename])
-                    seen_ref_offsets.add(base_offset)
+                    seen_ref_offsets.add(next_offset)
             else:
-                raise AssertionError(f"Unexpected delta type: {base_type}")
-            delta_stack.append((prev_offset, base_type, delta))
+                raise AssertionError(f"Unexpected delta type: {cur_type}")
 
-        # Now grab the base object (mustn't be a delta) and apply the
-        # deltas all the way up the stack.
-        chunks = base_obj
-        for prev_offset, _delta_type, delta in reversed(delta_stack):
-            # Convert chunks to bytes for apply_delta if needed
-            if isinstance(chunks, list):
-                chunks_bytes = b"".join(chunks)
-            elif isinstance(chunks, tuple):
-                # For tuple type, second element is the actual data
-                _, chunk_data = chunks
-                if isinstance(chunk_data, list):
-                    chunks_bytes = b"".join(chunk_data)
-                else:
-                    chunks_bytes = chunk_data
-            else:
-                chunks_bytes = chunks
+            assert isinstance(next_type, int)
+            delta_bytes: bytes = self._chunks_to_bytes(delta)
+            nodes.append((this_offset, delta_bytes))
+            cur_offset, cur_type, cur_obj = next_offset, next_type, next_obj
 
-            # Apply delta and get result as list
-            chunks = apply_delta(chunks_bytes, delta)
+            # Reuse an already-resolved, verified internal base if present.
+            if cur_type not in DELTA_TYPES and cur_offset is not None:
+                try:
+                    cur_type, cur_obj = self.data._get_resolved_object_at(
+                        cur_offset
+                    )
+                    break
+                except KeyError:
+                    pass
 
-            if prev_offset is not None:
-                self.data._cache_object_at(prev_offset, base_type, chunks)
+        # cur_obj is now the full base. Apply deltas back up to the target.
+        # Results are collected first and cached only after the whole chain
+        # succeeds and the requested object's OID is verified: an exception at
+        # any level leaves the reusable cache untouched.
+        base_type = cur_type
+        chunks: OldUnpackedObject = cur_obj
+        resolved: list[tuple[int, list[bytes]]] = []
+        node: tuple[int | None, bytes]
+        for node in reversed(nodes):
+            node_offset: int | None = node[0]
+            step_delta: bytes = node[1]
+            next_chunks = apply_delta(self._chunks_to_bytes(chunks), step_delta)
+            chunks = next_chunks
+            if node_offset is not None:
+                resolved.append((node_offset, next_chunks))
+
+        # The last resolved entry is the object the caller asked for. When
+        # verification is enabled, hash just that OID: if a top-of-chain object
+        # hashes to its recorded id, every base underneath it must be the exact
+        # correct full text too, so the intermediates are safe to reuse without
+        # hashing each one. A bad delta raises ApplyDeltaError above; a wrong
+        # checksum raises here, and in either case nothing below has been
+        # inserted into the resolved cache.
+        if self.verify_resolved and resolved:
+            top_offset, top_chunks = resolved[-1]
+            actual_sha = obj_sha(
+                base_type, top_chunks, self.object_format.hash_func
+            )
+            expected_sha = self._sha_for_offset(top_offset)
+            if actual_sha != expected_sha:
+                raise ChecksumMismatch(
+                    sha_to_hex(RawObjectID(expected_sha)),
+                    sha_to_hex(RawObjectID(actual_sha)),
+                )
+        for node_offset, result_chunks in resolved:
+            self.data._cache_resolved_object_at(
+                node_offset, base_type, result_chunks
+            )
+
         return base_type, chunks
+
+    def _sha_for_offset(self, offset: int) -> RawObjectID:
+        """Return the object ID recorded in the index for a pack offset."""
+        reverse: dict[int, RawObjectID] | None = getattr(
+            self, "_offset_to_sha", None
+        )
+        if reverse is None:
+            reverse = {
+                entry_offset: RawObjectID(sha)
+                for sha, entry_offset, _crc32 in self.index.iterentries()
+            }
+            self._offset_to_sha = reverse
+        return reverse[offset]
 
     def entries(
         self, progress: Callable[[int, int], None] | None = None

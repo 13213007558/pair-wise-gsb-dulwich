@@ -1,0 +1,177 @@
+[
+  {
+    "fanout": 256,
+    "depth": 1,
+    "objects": 257,
+    "pack_bytes": 558269,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 513,
+      "apply_delta": 256,
+      "inflate_bytes": 1078166,
+      "ext_ref": 0,
+      "seconds": 0.01241
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00055
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 128,
+    "depth": 2,
+    "objects": 257,
+    "pack_bytes": 556951,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 385,
+      "apply_delta": 256,
+      "inflate_bytes": 814829,
+      "ext_ref": 0,
+      "seconds": 0.01093
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00051
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 64,
+    "depth": 4,
+    "objects": 257,
+    "pack_bytes": 556929,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 321,
+      "apply_delta": 256,
+      "inflate_bytes": 683797,
+      "ext_ref": 0,
+      "seconds": 0.01114
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00049
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 32,
+    "depth": 8,
+    "objects": 257,
+    "pack_bytes": 556602,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 289,
+      "apply_delta": 256,
+      "inflate_bytes": 617965,
+      "ext_ref": 0,
+      "seconds": 0.01088
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00049
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 16,
+    "depth": 16,
+    "objects": 257,
+    "pack_bytes": 556265,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 273,
+      "apply_delta": 256,
+      "inflate_bytes": 584876,
+      "ext_ref": 0,
+      "seconds": 0.01057
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00049
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 8,
+    "depth": 32,
+    "objects": 257,
+    "pack_bytes": 556027,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 265,
+      "apply_delta": 256,
+      "inflate_bytes": 568262,
+      "ext_ref": 0,
+      "seconds": 0.01038
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00052
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  },
+  {
+    "fanout": 4,
+    "depth": 64,
+    "objects": 257,
+    "pack_bytes": 555865,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 261,
+      "apply_delta": 256,
+      "inflate_bytes": 559912,
+      "ext_ref": 0,
+      "seconds": 0.01052
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00048
+    },
+    "raw_cache_entries": 256,
+    "resolved_cache_entries": -1,
+    "resolved_cache_bytes": -1,
+    "mismatches": []
+  }
+]

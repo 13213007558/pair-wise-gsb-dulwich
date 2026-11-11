@@ -1,0 +1,127 @@
+[
+  {
+    "fanout": 64,
+    "depth": 1,
+    "objects": 65,
+    "pack_bytes": 4331299,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 65,
+      "apply_delta": 64,
+      "inflate_bytes": 4328908,
+      "ext_ref": 0,
+      "seconds": 0.02324
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00134
+    },
+    "raw_cache_entries": 65,
+    "resolved_cache_entries": 64,
+    "resolved_cache_bytes": 4194304,
+    "mismatches": []
+  },
+  {
+    "fanout": 32,
+    "depth": 2,
+    "objects": 65,
+    "pack_bytes": 4331748,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 65,
+      "apply_delta": 64,
+      "inflate_bytes": 4329370,
+      "ext_ref": 0,
+      "seconds": 0.02411
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00121
+    },
+    "raw_cache_entries": 65,
+    "resolved_cache_entries": 64,
+    "resolved_cache_bytes": 4194304,
+    "mismatches": []
+  },
+  {
+    "fanout": 16,
+    "depth": 4,
+    "objects": 65,
+    "pack_bytes": 4332356,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 65,
+      "apply_delta": 64,
+      "inflate_bytes": 4329999,
+      "ext_ref": 0,
+      "seconds": 0.02444
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00122
+    },
+    "raw_cache_entries": 65,
+    "resolved_cache_entries": 64,
+    "resolved_cache_bytes": 4194304,
+    "mismatches": []
+  },
+  {
+    "fanout": 8,
+    "depth": 8,
+    "objects": 65,
+    "pack_bytes": 4332292,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 65,
+      "apply_delta": 64,
+      "inflate_bytes": 4329947,
+      "ext_ref": 0,
+      "seconds": 0.02423
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.0012
+    },
+    "raw_cache_entries": 65,
+    "resolved_cache_entries": 64,
+    "resolved_cache_bytes": 4194304,
+    "mismatches": []
+  },
+  {
+    "fanout": 4,
+    "depth": 16,
+    "objects": 65,
+    "pack_bytes": 4332869,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 65,
+      "apply_delta": 64,
+      "inflate_bytes": 4330528,
+      "ext_ref": 0,
+      "seconds": 0.02446
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00111
+    },
+    "raw_cache_entries": 65,
+    "resolved_cache_entries": 64,
+    "resolved_cache_bytes": 4194304,
+    "mismatches": []
+  }
+]

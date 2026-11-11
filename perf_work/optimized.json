@@ -1,0 +1,177 @@
+[
+  {
+    "fanout": 256,
+    "depth": 1,
+    "objects": 257,
+    "pack_bytes": 558269,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 553878,
+      "ext_ref": 0,
+      "seconds": 0.0135
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00054
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 128,
+    "depth": 2,
+    "objects": 257,
+    "pack_bytes": 556951,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 552685,
+      "ext_ref": 0,
+      "seconds": 0.01259
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00045
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 64,
+    "depth": 4,
+    "objects": 257,
+    "pack_bytes": 556929,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 552725,
+      "ext_ref": 0,
+      "seconds": 0.01255
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00047
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 32,
+    "depth": 8,
+    "objects": 257,
+    "pack_bytes": 556602,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 552429,
+      "ext_ref": 0,
+      "seconds": 0.01217
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00044
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 16,
+    "depth": 16,
+    "objects": 257,
+    "pack_bytes": 556265,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 552108,
+      "ext_ref": 0,
+      "seconds": 0.01252
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00049
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 8,
+    "depth": 32,
+    "objects": 257,
+    "pack_bytes": 556027,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 551878,
+      "ext_ref": 0,
+      "seconds": 0.01258
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00046
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  },
+  {
+    "fanout": 4,
+    "depth": 64,
+    "objects": 257,
+    "pack_bytes": 555865,
+    "cache_limit": null,
+    "cold": {
+      "inflate": 257,
+      "apply_delta": 256,
+      "inflate_bytes": 551720,
+      "ext_ref": 0,
+      "seconds": 0.01238
+    },
+    "warm": {
+      "inflate": 0,
+      "apply_delta": 0,
+      "inflate_bytes": 0,
+      "ext_ref": 0,
+      "seconds": 0.00043
+    },
+    "raw_cache_entries": 257,
+    "resolved_cache_entries": 256,
+    "resolved_cache_bytes": 524288,
+    "mismatches": []
+  }
+]
