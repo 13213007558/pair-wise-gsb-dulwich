@@ -1731,6 +1731,121 @@ class DiskObjectStoreTests(PackBasedObjectStoreTests, TestCase):
         self.assertEqual([], leftovers)
 
 
+class QuarantineObjectStoreTests(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.store_dir)
+        self.store = DiskObjectStore.init(self.store_dir)
+        self.addCleanup(self.store.close)
+
+    def _quarantine(self):
+        quarantine = self.store.create_quarantine()
+        self.addCleanup(quarantine.cleanup)
+        return quarantine
+
+    def test_create_layout(self) -> None:
+        quarantine = self._quarantine()
+        self.assertTrue(os.path.isdir(quarantine.path))
+        self.assertTrue(os.path.isdir(quarantine.pack_dir))
+        self.assertEqual(os.path.dirname(os.fspath(quarantine.path)), self.store_dir)
+        self.assertTrue(
+            os.path.basename(os.fspath(quarantine.path)).startswith("incoming-")
+        )
+
+    def test_hook_env(self) -> None:
+        quarantine = self._quarantine()
+        env = quarantine.hook_env()
+        self.assertEqual(env["GIT_QUARANTINE_PATH"], os.fspath(quarantine.path))
+        self.assertEqual(env["GIT_OBJECT_DIRECTORY"], os.fspath(quarantine.path))
+        alternates = env["GIT_ALTERNATE_OBJECT_DIRECTORIES"].split(os.pathsep)
+        self.assertIn(self.store_dir, alternates)
+
+    def test_objects_hidden_from_base_store(self) -> None:
+        blob = make_object(Blob, data=b"quarantined data")
+        quarantine = self._quarantine()
+        quarantine.add_object(blob)
+        # Visible through the quarantine...
+        self.assertIn(blob.id, quarantine)
+        self.assertEqual((Blob.type_num, blob.data), quarantine.get_raw(blob.id))
+        # ...but not through the main store.
+        self.assertNotIn(blob.id, self.store)
+
+    def test_thin_pack_resolves_against_base_store(self) -> None:
+        base_blob = make_object(Blob, data=b"yummy data")
+        self.store.add_object(base_blob)
+        f = BytesIO()
+        entries = build_pack(
+            f, [(REF_DELTA, (base_blob.id, b"more yummy data"))], store=self.store
+        )
+        quarantine = self._quarantine()
+        quarantine.add_thin_pack(f.read, None)
+        packed_blob_sha = sha_to_hex(entries[0][3])
+        # The completed pack is readable through the quarantine, while the
+        # main store still only holds the base blob.
+        self.assertEqual(
+            (Blob.type_num, b"more yummy data"), quarantine.get_raw(packed_blob_sha)
+        )
+        self.assertNotIn(packed_blob_sha, self.store)
+        quarantine.publish()
+        self.assertEqual(
+            (Blob.type_num, b"more yummy data"), self.store.get_raw(packed_blob_sha)
+        )
+
+    def test_publish_moves_objects(self) -> None:
+        blob = make_object(Blob, data=b"publish me")
+        quarantine = self._quarantine()
+        quarantine.add_object(blob)
+        quarantine_path = os.fspath(quarantine.path)
+        quarantine.publish()
+        self.assertIn(blob.id, self.store)
+        self.assertEqual((Blob.type_num, blob.data), self.store.get_raw(blob.id))
+        self.assertFalse(os.path.exists(quarantine_path))
+
+    def test_publish_moves_packs(self) -> None:
+        blob = make_object(Blob, data=b"packed publish")
+        quarantine = self._quarantine()
+        f = BytesIO()
+        build_pack(f, [(Blob.type_num, blob.data)], store=self.store)
+        quarantine.add_thin_pack(f.read, None)
+        self.assertNotIn(blob.id, self.store)
+        quarantine.publish()
+        self.assertIn(blob.id, self.store)
+        self.assertEqual((Blob.type_num, blob.data), self.store.get_raw(blob.id))
+        # The pack landed in the main pack directory.
+        self.assertTrue(
+            any(
+                name.endswith(".pack")
+                for name in os.listdir(os.path.join(self.store_dir, "pack"))
+            )
+        )
+
+    def test_cleanup_discards_objects(self) -> None:
+        blob = make_object(Blob, data=b"discarded")
+        quarantine = self._quarantine()
+        quarantine.add_object(blob)
+        quarantine_path = os.fspath(quarantine.path)
+        quarantine.cleanup()
+        self.assertFalse(os.path.exists(quarantine_path))
+        self.assertNotIn(blob.id, self.store)
+        # The main object directory is left without quarantine traces.
+        self.assertEqual(["info", "pack"], sorted(os.listdir(self.store_dir)))
+
+    def test_cleanup_idempotent(self) -> None:
+        quarantine = self._quarantine()
+        quarantine.cleanup()
+        quarantine.cleanup()
+
+    def test_context_manager_cleans_up(self) -> None:
+        blob = make_object(Blob, data=b"context managed")
+        with self.store.create_quarantine() as quarantine:
+            quarantine.add_object(blob)
+            quarantine_path = os.fspath(quarantine.path)
+            self.assertIn(blob.id, quarantine)
+        self.assertFalse(os.path.exists(quarantine_path))
+        self.assertNotIn(blob.id, self.store)
+
+
 class TreeLookupPathTests(TestCase):
     def setUp(self) -> None:
         TestCase.setUp(self)

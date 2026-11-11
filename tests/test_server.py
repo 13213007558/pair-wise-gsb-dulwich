@@ -37,8 +37,8 @@ from dulwich.errors import (
 )
 from dulwich.object_filters import BlobNoneFilter
 from dulwich.object_store import MemoryObjectStore, find_shallow
-from dulwich.objects import Tree
-from dulwich.pack import write_pack_objects
+from dulwich.objects import Blob, Commit, Tree, sha_to_hex
+from dulwich.pack import REF_DELTA, write_pack_objects
 from dulwich.protocol import ZERO_SHA, format_capability_line
 from dulwich.repo import MemoryRepo, Repo
 from dulwich.server import (
@@ -56,7 +56,7 @@ from dulwich.server import (
     serve_command,
     update_server_info,
 )
-from dulwich.tests.utils import make_commit, make_tag
+from dulwich.tests.utils import build_pack, make_commit, make_object, make_tag
 
 from . import TestCase
 
@@ -597,6 +597,296 @@ class ReceivePackHandlerTestCase(TestCase):
         )
         self._handler.handle()
         mock_hook.execute.assert_not_called()
+
+
+class ReceivePackQuarantineTestCase(TestCase):
+    """Pushed objects are quarantined until the pre-receive hook accepts them."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._dir)
+        self._repo = Repo.init_bare(self._dir)
+        self.addCleanup(self._repo.close)
+        self._base_blob = make_object(Blob, data=b"base blob")
+        self._base_commit = make_commit()
+        self._repo.object_store.add_objects(
+            [(self._base_blob, None), (self._base_commit, None)]
+        )
+        self._repo.refs[b"refs/heads/master"] = self._base_commit.id
+        self._base_pack_dir = sorted(os.listdir(self._repo.object_store.pack_dir))
+
+    def _pack_bytes(self, objects_spec) -> bytes:
+        f = BytesIO()
+        build_pack(f, objects_spec, store=self._repo.object_store)
+        return f.getvalue()
+
+    def _run_push(self, updates, pack_bytes, read=None):
+        proto = TestProto()
+        lines = []
+        for i, (old, new, ref) in enumerate(updates):
+            line = b" ".join([old, new, ref])
+            if i == 0:
+                line += b"\x00report-status"
+            lines.append(line)
+        lines.append(None)
+        proto.set_output(lines)
+        proto.read = read if read is not None else BytesIO(pack_bytes).read
+        handler = ReceivePackHandler(DictBackend({b"/": self._repo}), [b"/"], proto)
+        handler.handle()
+        return proto
+
+    def _unpack_status(self, proto):
+        for line in proto._received[0]:
+            if line and line.startswith(b"unpack "):
+                return line[len(b"unpack ") :].rstrip()
+        return None
+
+    def _quarantine_leftovers(self):
+        objects_dir = os.fspath(self._repo.object_store.path)
+        return [
+            name
+            for name in os.listdir(objects_dir)
+            if name.startswith(("incoming-", "tmp_pack_"))
+        ]
+
+    def test_quarantined_objects_hidden_from_other_readers(self) -> None:
+        # Two parallel read views while the push is under review: the hook
+        # (through the handler's repo) sees the new commit, an ordinary
+        # reader of the same repository does not.
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+        reader = Repo(self._dir)
+        self.addCleanup(reader.close)
+        observations = {}
+        test = self
+
+        class InspectHook:
+            def execute(self, client_refs):
+                observations["hook"] = new_commit.id in test._repo.object_store
+                observations["reader"] = new_commit.id in reader.object_store
+                return (b"", b"")
+
+        self._repo.hooks["pre-receive"] = InspectHook()
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual({"hook": True, "reader": False}, observations)
+        # Once accepted, the objects are published and visible to readers.
+        self.assertIn(new_commit.id, reader.object_store)
+        self.assertEqual(new_commit.id, self._repo.refs[b"refs/heads/master"])
+        self.assertEqual([], self._quarantine_leftovers())
+
+    def test_pre_receive_decline_cleans_quarantine(self) -> None:
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+
+        class DeclineHook:
+            def execute(self, client_refs):
+                raise HookError("pre-receive hook declined")
+
+        self._repo.hooks["pre-receive"] = DeclineHook()
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"pre-receive hook declined", self._unpack_status(proto))
+        # The rejected objects left no trace in the repository.
+        self.assertNotIn(new_commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_leftovers())
+        self.assertEqual(
+            self._base_pack_dir, sorted(os.listdir(self._repo.object_store.pack_dir))
+        )
+        self.assertEqual(self._base_commit.id, self._repo.refs[b"refs/heads/master"])
+
+        # A subsequent legitimate push of the same objects succeeds.
+        del self._repo.hooks["pre-receive"]
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertIn(new_commit.id, self._repo.object_store)
+        self.assertEqual(new_commit.id, self._repo.refs[b"refs/heads/master"])
+
+    def test_corrupt_pack_cleans_quarantine(self) -> None:
+        proto = self._run_push(
+            [(self._base_commit.id, ONE, b"refs/heads/master")],
+            b"this is not a pack",
+        )
+        self.assertNotEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual([], self._quarantine_leftovers())
+        self.assertEqual(
+            self._base_pack_dir, sorted(os.listdir(self._repo.object_store.pack_dir))
+        )
+        self.assertEqual(self._base_commit.id, self._repo.refs[b"refs/heads/master"])
+
+        # A legitimate push afterwards is unaffected.
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(new_commit.id, self._repo.refs[b"refs/heads/master"])
+
+    def test_connection_abort_cleans_quarantine(self) -> None:
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+
+        def flaky_read(size):
+            raise ConnectionResetError("client went away")
+
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")],
+            b"",
+            read=flaky_read,
+        )
+        self.assertNotEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual([], self._quarantine_leftovers())
+        self.assertNotIn(new_commit.id, self._repo.object_store)
+
+        # A retry over a healthy connection succeeds.
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(new_commit.id, self._repo.refs[b"refs/heads/master"])
+
+    def test_thin_pack_deltas_against_base_store(self) -> None:
+        new_commit = make_commit(parents=[self._base_commit.id])
+        f = BytesIO()
+        entries = build_pack(
+            f,
+            [
+                (Commit.type_num, new_commit.as_raw_string()),
+                (REF_DELTA, (self._base_blob.id, b"derived from base blob")),
+            ],
+            store=self._repo.object_store,
+        )
+        new_blob_sha = sha_to_hex(entries[1][3])
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")],
+            f.getvalue(),
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(
+            (Blob.type_num, b"derived from base blob"),
+            self._repo.object_store.get_raw(new_blob_sha),
+        )
+        self.assertEqual([], self._quarantine_leftovers())
+
+    def test_update_hook_decline_after_publish(self) -> None:
+        # Once pre-receive has passed the objects are published; a declining
+        # update hook only rejects its own ref, like git.
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+
+        class DeclineUpdateHook:
+            def execute(self, ref_name, old_sha, new_sha):
+                raise HookError("update hook declined")
+
+        self._repo.hooks["update"] = DeclineUpdateHook()
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(self._base_commit.id, self._repo.refs[b"refs/heads/master"])
+        self.assertIn(new_commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_leftovers())
+
+    def test_shell_hook_reads_quarantined_objects(self) -> None:
+        if os.name != "posix":
+            self.skipTest("shell hooks require a POSIX shell")
+        blob = make_object(Blob, data=b"hook visible content")
+        tree = Tree()
+        tree.add(b"file.txt", 0o100644, blob.id)
+        commit = make_commit(parents=[self._base_commit.id], tree=tree.id)
+        pack = self._pack_bytes(
+            [
+                (Blob.type_num, blob.data),
+                (Tree.type_num, tree.as_raw_string()),
+                (Commit.type_num, commit.as_raw_string()),
+            ]
+        )
+        # The hook reads the pushed commit through the quarantine
+        # environment and records what it saw; it fails the push if the
+        # quarantined objects are not readable.
+        env_out = os.path.join(self._dir, "hook-env")
+        checker = os.path.join(self._dir, "check_quarantine.py")
+        with open(checker, "w") as f:
+            f.write(
+                "import os, sys\n"
+                "from dulwich.object_store import DiskObjectStore\n"
+                "quarantine = os.environ['GIT_OBJECT_DIRECTORY']\n"
+                "assert quarantine == os.environ['GIT_QUARANTINE_PATH']\n"
+                "alternates = os.environ['GIT_ALTERNATE_OBJECT_DIRECTORIES']"
+                ".split(os.pathsep)\n"
+                "store = DiskObjectStore(quarantine, alternates=alternates)\n"
+                "new_sha = sys.stdin.buffer.readline().split()[1]\n"
+                "commit = store[new_sha]\n"
+                "tree = store[commit.tree]\n"
+                "_, blob_sha = tree[b'file.txt']\n"
+                "blob = store[blob_sha]\n"
+                "assert blob.data == b'hook visible content'\n"
+                "# The ordinary object directory must not see the new commit.\n"
+                "main = DiskObjectStore(alternates[0])\n"
+                "assert new_sha not in main\n"
+                "with open(sys.argv[1], 'w') as fh:\n"
+                "    fh.write(quarantine)\n"
+            )
+        hooks_dir = os.path.join(self._repo.controldir(), "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        hook_path = os.path.join(hooks_dir, "pre-receive")
+        with open(hook_path, "w") as f:
+            f.write(f"#!/bin/sh\nexec {sys.executable} {checker} {env_out}\n")
+        os.chmod(hook_path, 0o755)
+
+        proto = self._run_push(
+            [(self._base_commit.id, commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(commit.id, self._repo.refs[b"refs/heads/master"])
+        with open(env_out) as f:
+            quarantine_path = f.read()
+        self.assertEqual(
+            os.path.dirname(quarantine_path),
+            os.fspath(self._repo.object_store.path),
+        )
+        self.assertTrue(os.path.basename(quarantine_path).startswith("incoming-"))
+        # Published: the quarantine directory itself is gone.
+        self.assertFalse(os.path.exists(quarantine_path))
+        self.assertEqual([], self._quarantine_leftovers())
+
+    def test_shell_hook_decline_cleans_quarantine(self) -> None:
+        if os.name != "posix":
+            self.skipTest("shell hooks require a POSIX shell")
+        new_commit = make_commit(parents=[self._base_commit.id])
+        pack = self._pack_bytes([(Commit.type_num, new_commit.as_raw_string())])
+        hooks_dir = os.path.join(self._repo.controldir(), "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        hook_path = os.path.join(hooks_dir, "pre-receive")
+        with open(hook_path, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook_path, 0o755)
+
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"pre-receive hook declined", self._unpack_status(proto))
+        self.assertNotIn(new_commit.id, self._repo.object_store)
+        self.assertEqual([], self._quarantine_leftovers())
+        self.assertEqual(
+            self._base_pack_dir, sorted(os.listdir(self._repo.object_store.pack_dir))
+        )
+        self.assertEqual(self._base_commit.id, self._repo.refs[b"refs/heads/master"])
+
+        # Removing the hook lets the same push through; nothing was polluted.
+        os.remove(hook_path)
+        proto = self._run_push(
+            [(self._base_commit.id, new_commit.id, b"refs/heads/master")], pack
+        )
+        self.assertEqual(b"ok", self._unpack_status(proto))
+        self.assertEqual(new_commit.id, self._repo.refs[b"refs/heads/master"])
 
 
 class ProtocolGraphWalkerEmptyTestCase(TestCase):

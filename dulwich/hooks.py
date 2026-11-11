@@ -262,13 +262,20 @@ class PreReceiveShellHook(ShellHook):
         ShellHook.__init__(self, "pre-receive", path=filepath, numparam=0)
 
     def execute(
-        self, client_refs: Sequence[tuple[bytes, bytes, bytes]]
+        self,
+        client_refs: Sequence[tuple[bytes, bytes, bytes]],
+        extra_env: "dict[str, str] | None" = None,
     ) -> tuple[bytes, bytes]:
         """Execute the pre-receive hook.
 
         Args:
             client_refs: List of tuples containing (old_sha, new_sha, ref_name)
                         for each reference to be updated
+            extra_env: Optional extra environment variables for the hook
+                        subprocess, e.g. the quarantine environment
+                        (GIT_QUARANTINE_PATH, GIT_OBJECT_DIRECTORY,
+                        GIT_ALTERNATE_OBJECT_DIRECTORIES) so the hook can
+                        read the pushed objects before they are published
 
         Returns:
             Tuple of (stdout, stderr) from hook execution
@@ -283,6 +290,8 @@ class PreReceiveShellHook(ShellHook):
         try:
             env = os.environ.copy()
             env["GIT_DIR"] = self.controldir
+            if extra_env:
+                env.update(extra_env)
 
             p = subprocess.Popen(
                 self.filepath,

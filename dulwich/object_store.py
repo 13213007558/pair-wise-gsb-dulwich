@@ -48,6 +48,7 @@ __all__ = [
     "PackContainer",
     "PackInputTooLarge",
     "PeelCache",
+    "QuarantineObjectStore",
     "commit_tree_changes",
     "find_shallow",
     "get_depth",
@@ -2957,6 +2958,177 @@ class DiskObjectStore(PackBasedObjectStore):
 
         # Call parent class close to handle pack files
         super().close()
+
+    def create_quarantine(self) -> "QuarantineObjectStore":
+        """Create a temporary quarantine object store layered over this one.
+
+        Returns:
+          New QuarantineObjectStore; call publish() to move its objects into
+          this store or cleanup() to discard them.
+        """
+        return QuarantineObjectStore.create(self)
+
+
+class QuarantineObjectStore(DiskObjectStore):
+    """Temporary object store isolating received objects until accepted.
+
+    Models git's quarantine environment (see git-receive-pack(1)): objects
+    pushed by a client are written to a temporary object directory inside
+    the main object directory, and the main store is consulted as an
+    alternate. Readers of the quarantine store therefore see both the
+    quarantined objects and the main store (which also lets thin packs
+    delta against objects that only exist in the main store), while
+    readers of the main store do not see the quarantined objects.
+
+    Once the objects are accepted (e.g. the pre-receive hook passed),
+    publish() migrates them into the main store. If the push is rejected,
+    the pack fails validation, or the connection drops, cleanup() removes
+    the quarantine directory without touching the main store.
+    """
+
+    base_store: DiskObjectStore
+
+    def __init__(
+        self, base_store: DiskObjectStore, path: str | os.PathLike[str]
+    ) -> None:
+        """Initialize a quarantine object store.
+
+        Args:
+          base_store: The main object store to layer over and publish into.
+          path: Path of the (existing) quarantine object directory.
+        """
+        super().__init__(
+            path,
+            loose_compression_level=base_store.loose_compression_level,
+            pack_compression_level=base_store.pack_compression_level,
+            pack_index_version=base_store.pack_index_version,
+            pack_delta_window_size=base_store.pack_delta_window_size,
+            pack_window_memory=base_store.pack_window_memory,
+            pack_delta_cache_size=base_store.pack_delta_cache_size,
+            pack_depth=base_store.pack_depth,
+            pack_threads=base_store.pack_threads,
+            pack_big_file_threshold=base_store.pack_big_file_threshold,
+            packed_git_limit=base_store.packed_git_limit,
+            delta_base_cache_limit=base_store.delta_base_cache_limit,
+            fsync_object_files=base_store.fsync_object_files,
+            pack_write_bitmaps=base_store.pack_write_bitmaps,
+            pack_write_bitmap_hash_cache=base_store.pack_write_bitmap_hash_cache,
+            pack_write_bitmap_lookup_table=base_store.pack_write_bitmap_lookup_table,
+            shared_perm=base_store.shared_perm,
+            object_format=base_store.object_format,
+            loose_object_size_limit=base_store.loose_object_size_limit,
+            alternates=[base_store.path, *base_store._extra_alternate_paths],
+            max_tree_depth=base_store.max_tree_depth,
+        )
+        self.base_store = base_store
+
+    @classmethod
+    def create(cls, base_store: DiskObjectStore) -> "QuarantineObjectStore":
+        """Create a quarantine object store for a main object store.
+
+        Args:
+          base_store: The main object store to quarantine against.
+
+        Returns:
+          New QuarantineObjectStore with a fresh temporary object directory
+          inside the main object directory.
+        """
+        import tempfile
+
+        path = tempfile.mkdtemp(prefix="incoming-", dir=os.fspath(base_store.path))
+        pack_dir = os.path.join(path, PACKDIR)
+        os.mkdir(pack_dir)
+        adjust_shared_perm(path, base_store.shared_perm)
+        adjust_shared_perm(pack_dir, base_store.shared_perm)
+        return cls(base_store, path)
+
+    def hook_env(self) -> dict[str, str]:
+        """Return the environment exposing this quarantine to hook subprocesses.
+
+        Mirrors the variables git sets for pre-receive/update hooks, so hook
+        subprocesses (e.g. git or dulwich commands) read quarantined objects
+        layered over the main object directory.
+
+        Returns:
+          Dict with GIT_QUARANTINE_PATH, GIT_OBJECT_DIRECTORY and
+          GIT_ALTERNATE_OBJECT_DIRECTORIES.
+        """
+        alternates = [os.fspath(self.base_store.path)]
+        alternates.extend(self.base_store._read_alternate_paths())
+        alternates.extend(self.base_store._extra_alternate_paths)
+        return {
+            "GIT_QUARANTINE_PATH": os.fspath(self.path),
+            "GIT_OBJECT_DIRECTORY": os.fspath(self.path),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.pathsep.join(alternates),
+        }
+
+    def publish(self) -> None:
+        """Move all quarantined objects into the main object store.
+
+        Pack files are moved into the main pack directory and registered
+        with the main store; loose objects are moved into place. The
+        quarantine directory is removed afterwards.
+        """
+        base = self.base_store
+        # Close cached packs so their file handles/maps don't pin the files
+        # being moved (which Windows would refuse).
+        self.close()
+        try:
+            pack_names = os.listdir(self.pack_dir)
+        except FileNotFoundError:
+            pack_names = []
+        for name in pack_names:
+            src = os.path.join(self.pack_dir, name)
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(base.pack_dir, name)
+            if os.path.exists(dst):
+                # Pack and index names are content-addressed, so an existing
+                # file holds the same objects; drop the duplicate.
+                _remove_readonly(src)
+            else:
+                os.rename(src, dst)
+                adjust_shared_perm(dst, base.shared_perm)
+        for sha in self._iter_loose_objects():
+            src = self._get_shafile_path(sha)
+            dst = base._get_shafile_path(sha)
+            if os.path.exists(dst):
+                _remove_readonly(src)
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(src, dst)
+            adjust_shared_perm(dst, base.shared_perm)
+        # Register the moved packs with the main store.
+        base._update_pack_cache()
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        """Discard the quarantine, removing all quarantined objects.
+
+        Safe to call multiple times and after publish(). Never touches the
+        main object store.
+        """
+        import shutil
+
+        self.close()
+        if os.path.isdir(self.path):
+            shutil.rmtree(
+                self.path,
+                onerror=lambda _f, p, _e: _remove_readonly(p),
+            )
+
+    def __enter__(self) -> "QuarantineObjectStore":
+        """Enter the quarantine context."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: "type[BaseException] | None",
+        exc_value: "BaseException | None",
+        traceback: "types.TracebackType | None",
+    ) -> None:
+        """Exit the quarantine context, discarding unpublished objects."""
+        self.cleanup()
 
 
 class MemoryObjectStore(PackCapableObjectStore):

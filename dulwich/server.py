@@ -106,7 +106,14 @@ from .object_filters import (
     filter_pack_objects_with_paths,
     parse_filter_spec,
 )
-from .object_store import MissingObjectFinder, PackBasedObjectStore, find_shallow
+from .hooks import PreReceiveShellHook
+from .object_store import (
+    DiskObjectStore,
+    MissingObjectFinder,
+    PackBasedObjectStore,
+    QuarantineObjectStore,
+    find_shallow,
+)
 from .objects import Commit, ObjectID, Tree, valid_hexsha
 from .pack import ObjectContainer, write_pack_from_container
 from .protocol import (
@@ -1502,22 +1509,61 @@ class ReceivePackHandler(PackHandler):
         if will_send_pack:
             # TODO: more informative error messages than just the exception
             # string
+            #
+            # Isolate the incoming objects in a quarantine store layered
+            # over the real object store: the pre-receive hook can read the
+            # new objects, but other readers of the repository cannot see
+            # them until the push is accepted and they are published.
+            store = self.repo.object_store
+            quarantine: QuarantineObjectStore | None = None
+            if isinstance(store, DiskObjectStore):
+                quarantine = store.create_quarantine()
+                target_store: PackBasedObjectStore = quarantine
+            else:
+                target_store = store  # type: ignore[assignment]
             try:
-                recv = getattr(self.proto, "recv", None)
-                self.repo.object_store.add_thin_pack(  # type: ignore[attr-defined]
-                    self.proto.read,
-                    recv,
-                    max_input_size=self._receive_max_input_size(),
-                )
+                try:
+                    recv = getattr(self.proto, "recv", None)
+                    target_store.add_thin_pack(
+                        self.proto.read,
+                        recv,
+                        max_input_size=self._receive_max_input_size(),
+                    )
+                except all_exceptions as e:
+                    yield (b"unpack", str(e).replace("\n", "").encode("utf-8"))
+                    return
+                # Objects are quarantined and validated; let the pre-receive
+                # hook inspect them before anything is published.
+                try:
+                    self._on_pre_receive(refs, quarantine=quarantine)
+                except HookError:
+                    yield (b"unpack", b"pre-receive hook declined")
+                    for _, _, ref in refs:
+                        yield (ref, b"pre-receive hook declined")
+                    return
+                if quarantine is not None:
+                    try:
+                        quarantine.publish()
+                    except all_exceptions as e:
+                        yield (b"unpack", str(e).replace("\n", "").encode("utf-8"))
+                        return
                 yield (b"unpack", b"ok")
-            except all_exceptions as e:
-                yield (b"unpack", str(e).replace("\n", "").encode("utf-8"))
-                # The pack may still have been moved in, but it may contain
-                # broken objects. We trust a later GC to clean it up.
-                return
+            finally:
+                # Discards any quarantined objects unless they were
+                # published; covers hook rejection, pack validation
+                # failures and connection aborts alike.
+                if quarantine is not None:
+                    quarantine.cleanup()
         else:
             # The git protocol want to find a status entry related to unpack
             # process even if no pack data has been sent.
+            try:
+                self._on_pre_receive(refs)
+            except HookError:
+                yield (b"unpack", b"pre-receive hook declined")
+                for _, _, ref in refs:
+                    yield (ref, b"pre-receive hook declined")
+                return
             yield (b"unpack", b"ok")
 
         atomic = self.has_capability(CAPABILITY_ATOMIC)
@@ -1648,12 +1694,20 @@ class ReceivePackHandler(PackHandler):
         flush()
 
     def _on_pre_receive(
-        self, client_refs: list[tuple[ObjectID, ObjectID, Ref]]
+        self,
+        client_refs: list[tuple[ObjectID, ObjectID, Ref]],
+        quarantine: "QuarantineObjectStore | None" = None,
     ) -> None:
         """Run pre-receive hook.
 
         Args:
             client_refs: List of (old_sha, new_sha, ref_name) tuples
+            quarantine: Quarantine object store holding the pushed objects,
+                if they have not been published yet. While the hook runs,
+                the repository object store is pointed at the quarantine so
+                in-process hooks can read the new objects, and shell hooks
+                receive the quarantine environment (GIT_QUARANTINE_PATH,
+                GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES).
 
         Raises:
             HookError: If hook fails, preventing the push
@@ -1661,8 +1715,17 @@ class ReceivePackHandler(PackHandler):
         hook = self.repo.hooks.get("pre-receive", None)  # type: ignore[attr-defined]
         if not hook:
             return
+        old_store = None
+        if quarantine is not None:
+            old_store = self.repo.object_store
+            self.repo.object_store = quarantine
         try:
-            stdout, stderr = hook.execute(client_refs)
+            if quarantine is not None and isinstance(hook, PreReceiveShellHook):
+                stdout, stderr = hook.execute(
+                    client_refs, extra_env=quarantine.hook_env()
+                )
+            else:
+                stdout, stderr = hook.execute(client_refs)
             # Only send output via sideband if capabilities are set
             if self._client_capabilities is not None:
                 if stdout and self.has_capability(CAPABILITY_SIDE_BAND_64K):
@@ -1679,6 +1742,9 @@ class ReceivePackHandler(PackHandler):
                 )
             # Re-raise to abort the push
             raise
+        finally:
+            if old_store is not None:
+                self.repo.object_store = old_store
 
     def _on_update(
         self, ref_name: Ref, old_sha: ObjectID, new_sha: ObjectID
@@ -1778,23 +1844,9 @@ class ReceivePackHandler(PackHandler):
             client_refs.append((ObjectID(oldsha), ObjectID(newsha), Ref(ref_name)))
             ref_line = self.proto.read_pkt_line()
 
-        # Run pre-receive hook before processing the pack
-        # If it fails, we abort the entire push
-        try:
-            self._on_pre_receive(client_refs)
-        except HookError:
-            # Hook failed, report error to client and abort
-            # We still need to consume the pack data to avoid protocol errors
-            if self.has_capability(CAPABILITY_REPORT_STATUS):
-                # Send unpack error status
-                status = [(b"unpack", b"pre-receive hook declined")]
-                # Add 'ng' (not good) status for all refs
-                for _, _, ref_name in client_refs:
-                    status.append((ref_name, b"pre-receive hook declined"))
-                self._report_status(status)
-            return
-
-        # backend can now deal with this refs and read a pack using self.read
+        # backend can now deal with this refs and read a pack using self.read.
+        # _apply_pack quarantines the incoming objects, runs the pre-receive
+        # hook against them, publishes them on success and updates the refs.
         status = list(self._apply_pack(client_refs))
 
         # status[0] is the unpack result; the rest follows client_refs.
