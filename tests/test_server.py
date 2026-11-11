@@ -780,6 +780,11 @@ class ProtocolGraphWalkerTestCase(TestCase):
 
     def _handle_shallow_request(self, lines, heads) -> None:
         self._walker.proto.set_output([*lines, None])
+        # The shallow boundary ids in these tests are all reachable from the
+        # advertised heads, so register the heads as the visible refs.
+        self._walker.handler._advertised_refs = {
+            b"refs/heads/head%d" % i: head for i, head in enumerate(heads)
+        }
         self._walker._handle_shallow_request(heads)
 
     def assertReceived(self, expected) -> None:

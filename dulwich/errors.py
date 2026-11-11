@@ -214,6 +214,29 @@ class GitProtocolError(Exception):
         return isinstance(other, GitProtocolError) and self.args == other.args
 
 
+class UnauthorizedObjectError(GitProtocolError):
+    """Client requested an object it is not authorized to receive.
+
+    Raised by an upload-pack object authorization policy when a
+    ``want``/``shallow``/``unshallow`` line names an object that is not
+    reachable from the refs advertised to this client. The request must be
+    rejected before any pack data is generated.
+    """
+
+    def __init__(self, object_id: bytes, reason: str | None = None) -> None:
+        """Initialize an UnauthorizedObjectError.
+
+        Args:
+          object_id: Hex object id the client was not allowed to request
+          reason: Optional explanation of why the object is not authorized
+        """
+        message = f"Client requested unauthorized object {object_id.decode('ascii')}"
+        if reason:
+            message = f"{message}: {reason}"
+        super().__init__(message)
+        self.object_id = object_id
+
+
 class SendPackError(GitProtocolError):
     """An error occurred during send_pack."""
 

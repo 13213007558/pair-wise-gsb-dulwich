@@ -53,6 +53,7 @@ __all__ = [
     "Handler",
     "MultiAckDetailedGraphWalkerImpl",
     "MultiAckGraphWalkerImpl",
+    "ObjectAuthorizationPolicy",
     "PackHandler",
     "ReceivePackHandler",
     "SingleAckGraphWalkerImpl",
@@ -60,6 +61,7 @@ __all__ = [
     "TCPGitServer",
     "UploadArchiveHandler",
     "UploadPackHandler",
+    "VisibleRefsAuthorizationPolicy",
     "generate_info_refs",
     "generate_objects_info_packs",
     "main",
@@ -96,6 +98,10 @@ from .errors import (
     NotGitRepository,
     ObjectFormatException,
     UnexpectedCommandError,
+)
+from .object_authz import (
+    ObjectAuthorizationPolicy,
+    VisibleRefsAuthorizationPolicy,
 )
 from .object_filters import (
     CombineFilter,
@@ -465,6 +471,7 @@ class UploadPackHandler(PackHandler):
         proto: Protocol,
         stateless_rpc: bool = False,
         advertise_refs: bool = False,
+        object_authorization_policy: ObjectAuthorizationPolicy | None = None,
     ) -> None:
         """Initialize an UploadPackHandler.
 
@@ -474,6 +481,11 @@ class UploadPackHandler(PackHandler):
           proto: Protocol instance for communication
           stateless_rpc: Whether this is a stateless RPC session
           advertise_refs: Whether to advertise refs
+          object_authorization_policy: Policy used to authorize objects
+            requested through want/shallow lines. Defaults to
+            :class:`VisibleRefsAuthorizationPolicy`, which only allows
+            objects reachable from the refs advertised to this client -
+            essential when refs are filtered per user.
         """
         super().__init__(backend, proto, stateless_rpc=stateless_rpc)
         self.repo = backend.open_repository(args[0])
@@ -485,6 +497,14 @@ class UploadPackHandler(PackHandler):
         self._processing_have_lines = False
         # Filter specification for partial clone support
         self.filter_spec: FilterSpec | None = None
+        if object_authorization_policy is None:
+            object_authorization_policy = VisibleRefsAuthorizationPolicy()
+        self.object_authorization_policy = object_authorization_policy
+        # Refs actually included in the advertisement for this client.
+        # They define the reachability boundary enforced by the
+        # authorization policy and are recorded while determine_wants()
+        # writes the advertisement.
+        self._advertised_refs: Mapping[Ref, ObjectID] = {}
 
     def capabilities(self) -> list[bytes]:
         """Return the list of capabilities supported by upload-pack.
@@ -581,7 +601,11 @@ class UploadPackHandler(PackHandler):
         if not self.has_capability(CAPABILITY_INCLUDE_TAG):
             return {}
         if refs is None:
-            refs = self.repo.get_refs()
+            # Only consider the refs that were advertised to this client:
+            # including a tag hidden from the advertisement would leak its
+            # object in the generated pack even if the tag itself was never
+            # sent on the wire.
+            refs = self._advertised_refs or self.repo.get_refs()
         if repo is None:
             repo = getattr(self.repo, "repo", None)
             if repo is None:
@@ -906,7 +930,9 @@ class _ProtocolGraphWalker:
         Returns: a list of SHA1s requested by the client
         """
         symrefs = self.get_symrefs()
-        values = set(heads.values())
+        # Record the refs this client is allowed to see; the authorization
+        # policy treats them as the reachability boundary.
+        self.handler._advertised_refs = heads
         if self.advertise_refs or not self.stateless_rpc:
             for i, (ref, sha) in enumerate(sorted(heads.items())):
                 try:
@@ -951,10 +977,23 @@ class _ProtocolGraphWalker:
         want_revs: list[ObjectID] = []
         while command == COMMAND_WANT:
             assert isinstance(sha_result, bytes)
-            if sha_result not in values:
-                raise GitProtocolError(f"Client wants invalid object {sha_result!r}")
+            # The object need not be the direct target of an advertised
+            # ref (e.g. commits, trees and blobs reachable from an advertised
+            # tip are valid wants); the authorization policy below makes the
+            # final decision before any pack data is generated.
             want_revs.append(ObjectID(sha_result))
             command, sha_result = self.read_proto_line(allowed)
+
+        # Authorize every requested object against the refs advertised to
+        # this client before any pack data is generated. A hidden object id
+        # guessed by the client is rejected here.
+        self.handler.object_authorization_policy.check_wants(
+            want_revs,
+            self.handler._advertised_refs,
+            self.store,
+            client_capabilities=self.handler._client_capabilities,
+            all_refs=self.handler.repo.get_refs(),
+        )
 
         self.set_wants(want_revs)
 
@@ -1064,6 +1103,16 @@ class _ProtocolGraphWalker:
             assert isinstance(val, bytes)
             self.client_shallow.add(ObjectID(val))
         self.read_proto_line((None,))  # consume client's flush-pkt
+
+        # Reject shallow boundaries anchored on commits this client cannot
+        # see before find_shallow() walks history on their behalf.
+        self.handler.object_authorization_policy.check_shallow_request(
+            self.client_shallow,
+            self.handler._advertised_refs,
+            self.store,
+            client_capabilities=self.handler._client_capabilities,
+            all_refs=self.handler.repo.get_refs(),
+        )
 
         shallow, not_shallow = find_shallow(self.store, wants, depth)
 
