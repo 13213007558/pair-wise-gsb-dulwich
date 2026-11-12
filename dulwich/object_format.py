@@ -34,6 +34,7 @@ __all__ = [
     "ObjectFormat",
     "get_object_format",
     "verify_same_object_format",
+    "zero_object_id",
 ]
 
 from collections.abc import Callable
@@ -180,3 +181,19 @@ def verify_same_object_format(*formats: ObjectFormat) -> ObjectFormat:
             raise ValueError(f"Object format mismatch: {first.name} != {fmt.name}")
 
     return first
+
+
+def zero_object_id(object_format: ObjectFormat) -> bytes:
+    """Return the all-zero object ID for the given object format.
+
+    The all-zero ID is used on the wire (and in ref update lines in
+    particular) to signal the absence of an object; its width is the
+    hexadecimal length of the format (40 for SHA-1, 64 for SHA-256).
+
+    Args:
+        object_format: Object format to build the zero ID for
+
+    Returns:
+        Hexadecimal all-zero object ID as bytes
+    """
+    return b"0" * object_format.hex_length

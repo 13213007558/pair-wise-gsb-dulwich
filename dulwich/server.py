@@ -120,6 +120,7 @@ from .protocol import (
     CAPABILITY_MULTI_ACK_DETAILED,
     CAPABILITY_NO_DONE,
     CAPABILITY_NO_PROGRESS,
+    CAPABILITY_OBJECT_FORMAT,
     CAPABILITY_OFS_DELTA,
     CAPABILITY_QUIET,
     CAPABILITY_REPORT_STATUS,
@@ -432,8 +433,62 @@ class PackHandler(Handler):
                 raise GitProtocolError(
                     f"Client does not support required capability {cap!r}."
                 )
+        self._validate_object_format(caps)
         self._client_capabilities = set(caps)
         logger.info("Client capabilities: %s", caps)
+
+    def _validate_object_format(self, caps: Iterable[bytes]) -> None:
+        """Validate the negotiated object format against the repository.
+
+        The object-format capability advertised by this handler names the
+        hash algorithm used by the repository on disk. A client that asks
+        for a different algorithm cannot exchange objects with it: its object
+        IDs have a different width and the pack/index trailers use a
+        different hash. Reject the request here, before any pack data is
+        read or refs are touched, rather than failing deep in pack parsing
+        (or, worse, silently reinterpreting the data).
+
+        Args:
+          caps: List of capabilities requested by the client
+        Raises:
+          GitProtocolError: If the requested object format is unknown or
+              differs from the repository's format
+        """
+        from .object_format import OBJECT_FORMATS
+
+        requested = find_capability(caps, CAPABILITY_OBJECT_FORMAT)
+        if requested is None:
+            # A client that does not speak the capability is assumed to use
+            # the historical default (SHA-1).
+            return
+        requested_name = requested.decode("ascii")
+        if requested_name not in OBJECT_FORMATS:
+            raise GitProtocolError(
+                f"Client requested unsupported object format {requested!r}."
+            )
+        repo_format = self.repo.object_format.name
+        if requested_name != repo_format:
+            raise GitProtocolError(
+                f"Object format mismatch: client requested {requested!r} but "
+                f"repository uses {repo_format.encode('ascii')!r}."
+            )
+
+    def _validate_object_id_width(self, sha: bytes) -> None:
+        """Validate that a wire object ID matches the repository hash width.
+
+        Args:
+          sha: Hexadecimal object ID received from the client
+        Raises:
+          GitProtocolError: If the ID does not have the repository's
+              hexadecimal hash length
+        """
+        expected = self.repo.object_format.hex_length
+        if len(sha) != expected:
+            raise GitProtocolError(
+                f"Object ID {sha!r} has length {len(sha)} but repository "
+                f"object format {self.repo.object_format.name!r} requires "
+                f"{expected} hex characters"
+            )
 
     def has_capability(self, cap: bytes) -> bool:
         """Check if the client supports a specific capability.
@@ -951,6 +1006,7 @@ class _ProtocolGraphWalker:
         want_revs: list[ObjectID] = []
         while command == COMMAND_WANT:
             assert isinstance(sha_result, bytes)
+            self.handler._validate_object_id_width(sha_result)
             if sha_result not in values:
                 raise GitProtocolError(f"Client wants invalid object {sha_result!r}")
             want_revs.append(ObjectID(sha_result))
@@ -1568,12 +1624,16 @@ class ReceivePackHandler(PackHandler):
                 try:
                     if sha == zero_sha:
                         try:
-                            self.repo.refs.remove_if_equals(ref, oldsha)
+                            self.repo.refs.remove_if_equals(
+                                ref, None if oldsha == zero_sha else oldsha
+                            )
                         except all_exceptions:
                             ref_status = b"failed to delete"
                     else:
                         try:
-                            self.repo.refs.set_if_equals(ref, oldsha, sha)
+                            self.repo.refs.set_if_equals(
+                                ref, None if oldsha == zero_sha else oldsha, sha
+                            )
                         except all_exceptions:
                             ref_status = b"failed to write"
                 except KeyError:
@@ -1603,12 +1663,16 @@ class ReceivePackHandler(PackHandler):
                                 "delete-refs capability."
                             )
                         try:
-                            self.repo.refs.remove_if_equals(ref, oldsha)
+                            self.repo.refs.remove_if_equals(
+                                ref, None if oldsha == zero_sha else oldsha
+                            )
                         except all_exceptions:
                             ref_status = b"failed to delete"
                     else:
                         try:
-                            self.repo.refs.set_if_equals(ref, oldsha, sha)
+                            self.repo.refs.set_if_equals(
+                                ref, None if oldsha == zero_sha else oldsha, sha
+                            )
                         except all_exceptions:
                             ref_status = b"failed to write"
                 except KeyError:
@@ -1775,6 +1839,12 @@ class ReceivePackHandler(PackHandler):
                 raise GitProtocolError(
                     f"Invalid ref update line from client: {ref_line!r}"
                 )
+            # valid_hexsha accepts both SHA-1 and SHA-256 widths; pin the
+            # accepted width to this repository's object format so an ID
+            # belonging to a different hash algorithm is rejected before the
+            # pack stream is read or any refs are updated.
+            self._validate_object_id_width(oldsha)
+            self._validate_object_id_width(newsha)
             client_refs.append((ObjectID(oldsha), ObjectID(newsha), Ref(ref_name)))
             ref_line = self.proto.read_pkt_line()
 

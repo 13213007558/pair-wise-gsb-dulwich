@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from .config import Config
     from .object_format import ObjectFormat
 
-from .errors import NotTreeError
+from .errors import NotTreeError, ObjectFormatException
 from .file import GitFile, SharedPerm, _GitFile, adjust_shared_perm
 from .lru_cache import LRUCache
 from .midx import MultiPackIndex, load_midx
@@ -1993,10 +1993,51 @@ class DiskObjectStore(PackBasedObjectStore):
             return self._alternates
         self._alternates = []
         for path in self._read_alternate_paths():
-            self._alternates.append(DiskObjectStore(path))
+            self._alternates.append(self._open_alternate(path))
         for path in self._extra_alternate_paths:
-            self._alternates.append(DiskObjectStore(path))
+            self._alternates.append(self._open_alternate(path))
         return self._alternates
+
+    def _open_alternate(self, path: str) -> "DiskObjectStore":
+        """Open an alternate object directory in this store's format.
+
+        Alternate object directories share the hash algorithm of the
+        repository that references them; Git does not support mixing
+        formats across an alternates link. Open the alternate with this
+        store's object format (previously it always defaulted to SHA-1,
+        which silently broke SHA-256 repositories) and refuse a directory
+        whose own configuration requests a different format.
+
+        Args:
+          path: Path of the alternate objects directory
+
+        Raises:
+          ObjectFormatException: If the alternate is configured for a
+              different object format
+        """
+        alternate = DiskObjectStore(path, object_format=self.object_format)
+        alt_config_path = os.path.join(os.path.dirname(path), "config")
+        try:
+            from .config import ConfigFile
+
+            alt_config = ConfigFile.from_path(alt_config_path)
+        except (FileNotFoundError, OSError, KeyError):
+            return alternate
+        try:
+            configured = alt_config.get((b"extensions",), b"objectformat")
+        except KeyError:
+            return alternate
+        if isinstance(configured, bytes):
+            configured = configured.decode("ascii")
+        from .object_format import get_object_format
+
+        alt_format = get_object_format(configured)
+        if alt_format != self.object_format:
+            raise ObjectFormatException(
+                f"Alternate object store at {path!r} uses object format "
+                f"{alt_format.name!r}, expected {self.object_format.name!r}"
+            )
+        return alternate
 
     def _read_alternate_paths(self) -> Iterator[str]:
         try:
@@ -3030,7 +3071,7 @@ class MemoryObjectStore(PackCapableObjectStore):
 
     def add_object(self, obj: ShaFile) -> None:
         """Add a single object to this object store."""
-        self._data[obj.id] = obj.copy()
+        self._data[ObjectID(obj.get_id(self.object_format))] = obj.copy()
 
     def add_objects(
         self,

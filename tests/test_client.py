@@ -1700,7 +1700,7 @@ class LocalGitClientTests(TestCase):
         self.assertIn(b"HEAD", result.symrefs)
 
     def test_fetch_object_format_mismatch_sha256_to_sha1(self) -> None:
-        """Test that fetching from SHA-256 to non-empty SHA-1 repository fails."""
+        """Fetching across hash formats is refused, even for non-empty repos."""
         client = LocalGitClient()
 
         # Create SHA-256 source repository
@@ -1709,25 +1709,26 @@ class LocalGitClientTests(TestCase):
         sha256_repo = Repo.init(sha256_path, object_format="sha256")
         self.addCleanup(sha256_repo.close)
 
-        # Create SHA-1 target repository with an object (so it can't be auto-changed)
+        # Create SHA-1 target repository with an object
         sha1_path = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sha1_path)
         sha1_repo = Repo.init(sha1_path, object_format="sha1")
         self.addCleanup(sha1_repo.close)
 
-        # Add an object to make the repo non-empty
         blob = Blob.from_string(b"test content")
         sha1_repo.object_store.add_object(blob)
+        objects_before = list(sha1_repo.object_store)
 
-        # Attempt to fetch should raise AssertionError (repo not empty)
-        with self.assertRaises(AssertionError) as cm:
+        with self.assertRaises(GitProtocolError) as cm:
             client.fetch(sha256_path, sha1_repo)
 
-        self.assertIn("Cannot change object format", str(cm.exception))
-        self.assertIn("already contains objects", str(cm.exception))
+        self.assertIn("Object format mismatch", str(cm.exception))
+        # The target must keep its original format and object set.
+        self.assertEqual(sha1_repo.object_format.name, "sha1")
+        self.assertEqual(list(sha1_repo.object_store), objects_before)
 
     def test_fetch_object_format_mismatch_sha1_to_sha256(self) -> None:
-        """Test that fetching from SHA-1 to non-empty SHA-256 repository fails."""
+        """Fetching across hash formats is refused, even for empty repos."""
         client = LocalGitClient()
 
         # Create SHA-1 source repository
@@ -1736,22 +1737,20 @@ class LocalGitClientTests(TestCase):
         sha1_repo = Repo.init(sha1_path, object_format="sha1")
         self.addCleanup(sha1_repo.close)
 
-        # Create SHA-256 target repository with an object (so it can't be auto-changed)
+        # Create an *empty* SHA-256 target; previously this silently switched
+        # the target to SHA-1 instead of rejecting the mismatch.
         sha256_path = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sha256_path)
         sha256_repo = Repo.init(sha256_path, object_format="sha256")
         self.addCleanup(sha256_repo.close)
 
-        # Add an object to make the repo non-empty
-        blob = Blob.from_string(b"test content")
-        sha256_repo.object_store.add_object(blob)
-
-        # Attempt to fetch should raise AssertionError (repo not empty)
-        with self.assertRaises(AssertionError) as cm:
+        with self.assertRaises(GitProtocolError) as cm:
             client.fetch(sha1_path, sha256_repo)
 
-        self.assertIn("Cannot change object format", str(cm.exception))
-        self.assertIn("already contains objects", str(cm.exception))
+        self.assertIn("Object format mismatch", str(cm.exception))
+        # An empty target must not be re-initialized to the remote format.
+        self.assertEqual(sha256_repo.object_format.name, "sha256")
+        self.assertEqual(list(sha256_repo.object_store), [])
 
     def test_fetch_object_format_same(self) -> None:
         """Test that fetching between repositories with same object format works."""

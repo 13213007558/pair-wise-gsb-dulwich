@@ -101,6 +101,7 @@ if TYPE_CHECKING:
 
 from . import _deprecated_aliases, reflog
 from .errors import (
+    GitProtocolError,
     NoIndexPresent,
     NotBlobError,
     NotCommitError,
@@ -660,7 +661,12 @@ class BaseRepo:
         # Set hash algorithm based on object format
         from .object_format import get_object_format
 
-        self.object_format = get_object_format(object_format)
+        new_object_format = get_object_format(object_format)
+        self.object_format = new_object_format
+        # Keep the object store consistent with the repository format;
+        # otherwise objects added immediately after init_bare are hashed and
+        # interpreted with the default (SHA-1) width even in a SHA-256 repo.
+        self.object_store.object_format = new_object_format
 
         if self._determine_file_mode():
             cf.set("core", "filemode", True)
@@ -802,10 +808,15 @@ class BaseRepo:
           depth: Optional shallow fetch depth
         Returns: The local refs
         """
-        # Fix object format if needed
+        # Refuse a cross-format fetch instead of silently reinitializing the
+        # target to a different hash algorithm. Objects from a foreign format
+        # cannot be interpreted with the target's ID width and pack trailer.
         if self.object_format != target.object_format:
-            # Change the target repo's format if it's empty
-            target._change_object_format(self.object_format.name)
+            raise GitProtocolError(
+                f"Object format mismatch: source repository uses "
+                f"{self.object_format.name!r} but target uses "
+                f"{target.object_format.name!r}"
+            )
 
         if determine_wants is None:
             determine_wants = target.object_store.determine_wants_all

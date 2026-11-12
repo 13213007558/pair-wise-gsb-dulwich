@@ -183,7 +183,11 @@ from .config import (
 )
 from .credentials import match_partial_url, match_urls
 from .errors import GitProtocolError, HangupException, NotGitRepository, SendPackError
-from .object_format import DEFAULT_OBJECT_FORMAT
+from .object_format import (
+    DEFAULT_OBJECT_FORMAT,
+    get_object_format,
+    zero_object_id,
+)
 from .object_store import GraphWalker
 from .objects import ObjectID, valid_hexsha
 from .pack import (
@@ -204,6 +208,7 @@ from .protocol import (
     CAPABILITY_INCLUDE_TAG,
     CAPABILITY_MULTI_ACK,
     CAPABILITY_MULTI_ACK_DETAILED,
+    CAPABILITY_OBJECT_FORMAT,
     CAPABILITY_OFS_DELTA,
     CAPABILITY_PACKFILE_URIS,
     CAPABILITY_PUSH_OPTIONS,
@@ -828,9 +833,11 @@ class _v1ReceivePackHeader:
         old_refs: Mapping[Ref, ObjectID],
         new_refs: Mapping[Ref, ObjectID],
         push_options: Sequence[bytes] | None = None,
+        zero_sha: ObjectID = ZERO_SHA,
     ) -> None:
         self.want: set[ObjectID] = set()
         self.have: set[ObjectID] = set()
+        self.zero_sha = zero_sha
         self._it = self._handle_receive_pack_head(
             capabilities, old_refs, new_refs, push_options
         )
@@ -857,17 +864,17 @@ class _v1ReceivePackHeader:
         Returns:
           (have, want) tuple
         """
-        self.have = {x for x in old_refs.values() if not x == ZERO_SHA}
+        self.have = {x for x in old_refs.values() if not x == self.zero_sha}
 
         for refname in new_refs:
             if not isinstance(refname, bytes):
                 raise TypeError(f"refname is not a bytestring: {refname!r}")
-            old_sha1 = old_refs.get(refname, ZERO_SHA)
+            old_sha1 = old_refs.get(refname, self.zero_sha)
             if not isinstance(old_sha1, bytes):
                 raise TypeError(
                     f"old sha1 for {refname!r} is not a bytestring: {old_sha1!r}"
                 )
-            new_sha1 = new_refs.get(refname, ZERO_SHA)
+            new_sha1 = new_refs.get(refname, self.zero_sha)
             if not isinstance(new_sha1, bytes):
                 raise TypeError(
                     f"old sha1 for {refname!r} is not a bytestring {new_sha1!r}"
@@ -890,7 +897,7 @@ class _v1ReceivePackHeader:
                         + b" ".join(sorted(capabilities))
                     )
                     self.sent_capabilities = True
-            if new_sha1 not in self.have and new_sha1 != ZERO_SHA:
+            if new_sha1 not in self.have and new_sha1 != self.zero_sha:
                 self.want.add(new_sha1)
         # flush-pkt after ref commands
         yield None
@@ -1418,6 +1425,41 @@ class GitClient:
             self._fetch_capabilities.add(CAPABILITY_INCLUDE_TAG)
         self.protocol_version = 0  # will be overridden later
 
+    @staticmethod
+    def _remote_object_format(server_capabilities: Iterable[bytes]):
+        """Resolve the object format advertised by a server.
+
+        Args:
+          server_capabilities: Capability strings sent by the server
+
+        Returns:
+          The advertised ObjectFormat, or the default (SHA-1) when the
+          server does not advertise the object-format capability
+        """
+        name = extract_object_format_from_capabilities(set(server_capabilities))
+        if name is None:
+            return DEFAULT_OBJECT_FORMAT
+        return get_object_format(name)
+
+    def _assert_matches_local_format(self, remote_format, local_format) -> None:
+        """Refuse an exchange when local and remote hash formats differ.
+
+        This keeps the failure explicit (and early) instead of producing
+        malformed packs or silently converting the local repository.
+
+        Args:
+          remote_format: ObjectFormat advertised by the server
+          local_format: ObjectFormat of the local repository
+
+        Raises:
+          GitProtocolError: If the two formats differ
+        """
+        if remote_format != local_format:
+            raise GitProtocolError(
+                f"Object format mismatch: local repository uses "
+                f"{local_format.name!r} but remote uses {remote_format.name!r}"
+            )
+
     def close(self) -> None:
         """Close the client and release any resources.
 
@@ -1784,13 +1826,17 @@ class GitClient:
             # Report final progress
             progress_wrapper.finalize()
 
-            # Fix object format if needed
-            if (
-                result.object_format
-                and result.object_format != target.object_format.name
-            ):
-                # Change the target repo's format if it's empty
-                target._change_object_format(result.object_format)
+            # Verify the negotiated object format matches the target
+            # repository before the pack is committed into its object store.
+            # A mismatched pack uses different object ID widths and a different
+            # trailing hash, so ingesting it would corrupt the store; the old
+            # behavior of silently reinitializing the (empty) target to the
+            # remote format hid that failure from callers.
+            if result.object_format is not None:
+                remote_format = get_object_format(result.object_format)
+                self._assert_matches_local_format(
+                    remote_format, target.object_format
+                )
         except BaseException:
             abort()
             raise
@@ -1944,13 +1990,15 @@ class GitClient:
 
     @staticmethod
     def _should_send_pack(
-        old_refs: Mapping[Ref, ObjectID], new_refs: Mapping[Ref, ObjectID]
+        old_refs: Mapping[Ref, ObjectID],
+        new_refs: Mapping[Ref, ObjectID],
+        zero_sha: ObjectID = ZERO_SHA,
     ) -> bool:
         # The packfile MUST NOT be sent if the only command used is delete.
         # Only refs whose value actually changes result in a command, so
         # unchanged refs must not be considered here.
         return any(
-            new_sha != ZERO_SHA and old_refs.get(refname, ZERO_SHA) != new_sha
+            new_sha != zero_sha and old_refs.get(refname, zero_sha) != new_sha
             for refname, new_sha in new_refs.items()
         )
 
@@ -2181,6 +2229,8 @@ class TraditionalGitClient(GitClient):
                 negotiated_capabilities,
                 agent,
             ) = self._negotiate_receive_pack_capabilities(server_capabilities)
+            remote_format = self._remote_object_format(server_capabilities)
+            remote_zero_sha = ObjectID(zero_object_id(remote_format))
             if CAPABILITY_REPORT_STATUS in negotiated_capabilities:
                 self._report_status_parser = ReportStatusParser()
             report_status_parser = self._report_status_parser
@@ -2205,6 +2255,14 @@ class TraditionalGitClient(GitClient):
                 proto.write_pkt_line(None)
                 raise
 
+            # Translate the historical 40-character zero ID (used by callers
+            # built before SHA-256 support) to the remote format's width.
+            new_refs = {
+                ref: (remote_zero_sha if sha == ZERO_SHA else sha)
+                for ref, sha in new_refs.items()
+            }
+            orig_new_refs = new_refs
+
             if set(new_refs.items()).issubset(set(old_refs.items())):
                 proto.write_pkt_line(None)
                 # Convert new_refs to match SendPackResult expected type
@@ -2216,7 +2274,7 @@ class TraditionalGitClient(GitClient):
                 # Server does not support deletions. Fail later.
                 new_refs = dict(orig_new_refs)
                 for ref, sha in orig_new_refs.items():
-                    if sha == ZERO_SHA:
+                    if sha == remote_zero_sha:
                         if CAPABILITY_REPORT_STATUS in negotiated_capabilities:
                             assert report_status_parser is not None
                             report_status_parser._ref_statuses.append(
@@ -2247,6 +2305,7 @@ class TraditionalGitClient(GitClient):
                 old_refs,
                 new_refs,
                 push_options=push_options,
+                zero_sha=remote_zero_sha,
             )
 
             for pkt in header_handler:
@@ -2259,11 +2318,13 @@ class TraditionalGitClient(GitClient):
                 progress=progress,
             )
 
-            if self._should_send_pack(old_refs, new_refs):
+            if self._should_send_pack(
+                old_refs, new_refs, zero_sha=remote_zero_sha
+            ):
                 for chunk in PackChunkGenerator(
                     num_records=pack_data_count,
                     records=pack_data,
-                    object_format=DEFAULT_OBJECT_FORMAT,
+                    object_format=remote_format,
                 ):
                     proto.write(chunk)
 
@@ -2404,7 +2465,12 @@ class TraditionalGitClient(GitClient):
                 proto.write_pkt_line(None)
                 raise
             if wants is not None:
-                wants = [cid for cid in wants if cid != ZERO_SHA]
+                remote_zero = ObjectID(
+                    zero_object_id(
+                        self._remote_object_format(server_capabilities)
+                    )
+                )
+                wants = [cid for cid in wants if cid != remote_zero]
             if not wants:
                 proto.write_pkt_line(None)
                 return FetchPackResult(
@@ -3103,16 +3169,36 @@ class LocalGitClient(GitClient):
         )
 
         with self._open_repo(path) as target:
+            target_zero_sha = ObjectID(
+                zero_object_id(target.object_format)
+            )
             old_refs = target.get_refs()
             new_refs = update_refs(dict(old_refs))
+            # Callers built before SHA-256 support use the 40-character
+            # ZERO_SHA to signal deletions; translate it to the target's
+            # width while rejecting IDs of any other foreign width.
+            translated_new_refs: dict[Ref, ObjectID] = {}
+            for refname, sha in new_refs.items():
+                if sha == ZERO_SHA:
+                    translated_new_refs[refname] = target_zero_sha
+                elif len(sha) != target.object_format.hex_length:
+                    raise GitProtocolError(
+                        f"Object ID {sha!r} for ref {refname!r} has length "
+                        f"{len(sha)} but target repository object format "
+                        f"{target.object_format.name!r} requires "
+                        f"{target.object_format.hex_length} hex characters"
+                    )
+                else:
+                    translated_new_refs[refname] = sha
+            new_refs = translated_new_refs
 
-            have = [sha1 for sha1 in old_refs.values() if sha1 != ZERO_SHA]
+            have = [sha1 for sha1 in old_refs.values() if sha1 != target_zero_sha]
             want = []
             for refname, new_sha1 in new_refs.items():
                 if (
                     new_sha1 not in have
                     and new_sha1 not in want
-                    and new_sha1 != ZERO_SHA
+                    and new_sha1 != target_zero_sha
                 ):
                     want.append(new_sha1)
 
@@ -3130,8 +3216,8 @@ class LocalGitClient(GitClient):
             if atomic:
                 # Validate all ref updates first before applying any
                 for refname, new_sha1 in new_refs.items():
-                    old_sha1 = old_refs.get(refname, ZERO_SHA)
-                    if new_sha1 != ZERO_SHA:
+                    old_sha1 = old_refs.get(refname, target_zero_sha)
+                    if new_sha1 != target_zero_sha:
                         current = target.refs.get_peeled(refname)
                         if current is not None and current != old_sha1:
                             ref_status[refname] = (
@@ -3151,14 +3237,20 @@ class LocalGitClient(GitClient):
                     )
 
             for refname, new_sha1 in new_refs.items():
-                old_sha1 = old_refs.get(refname, ZERO_SHA)
-                if new_sha1 != ZERO_SHA:
-                    if not target.refs.set_if_equals(refname, old_sha1, new_sha1):
+                old_sha1 = old_refs.get(refname, target_zero_sha)
+                # A zero old value means the ref does not exist yet; the refs
+                # containers treat an absent expected value as None rather
+                # than an all-zero object ID.
+                compare_old = None if old_sha1 == target_zero_sha else old_sha1
+                if new_sha1 != target_zero_sha:
+                    if not target.refs.set_if_equals(
+                        refname, compare_old, new_sha1
+                    ):
                         msg = f"unable to set {refname!r} to {new_sha1!r}"
                         _progress(msg.encode())
                         ref_status[refname] = msg
                 else:
-                    if not target.refs.remove_if_equals(refname, old_sha1):
+                    if not target.refs.remove_if_equals(refname, compare_old):
                         _progress(f"unable to remove {refname!r}".encode())
                         ref_status[refname] = "unable to remove"
 
@@ -3202,6 +3294,9 @@ class LocalGitClient(GitClient):
 
         """
         with self._open_repo(path) as r:
+            self._assert_matches_local_format(
+                r.object_format, target.object_format
+            )
             refs = r.fetch(
                 target,
                 determine_wants=determine_wants,
@@ -3680,7 +3775,9 @@ class BundleClient(GitClient):
         from io import BytesIO
 
         pack_io = BytesIO(pack_bytes)
-        pack_data = PackData.from_file(pack_io, object_format=DEFAULT_OBJECT_FORMAT)
+        pack_data = PackData.from_file(
+            pack_io, object_format=target.object_store.object_format
+        )
         try:
             target.object_store.add_pack_data(len(pack_data), pack_data.iter_unpacked())
         finally:
@@ -4956,6 +5053,8 @@ class AbstractHttpGitClient(GitClient):
             agent,
         ) = self._negotiate_receive_pack_capabilities(server_capabilities)
         negotiated_capabilities.add(capability_agent())
+        remote_format = self._remote_object_format(server_capabilities)
+        remote_zero_sha = ObjectID(zero_object_id(remote_format))
 
         if CAPABILITY_REPORT_STATUS in negotiated_capabilities:
             self._report_status_parser = ReportStatusParser()
@@ -4986,6 +5085,12 @@ class AbstractHttpGitClient(GitClient):
             return SendPackResult(
                 _to_optional_dict(old_refs_typed), agent=agent, ref_status={}
             )
+        # Translate the historical 40-character zero ID (used by callers
+        # built before SHA-256 support) to the remote format's width.
+        new_refs = {
+            ref: (remote_zero_sha if sha == ZERO_SHA else sha)
+            for ref, sha in new_refs.items()
+        }
         if set(new_refs.items()).issubset(set(old_refs_typed.items())):
             # Convert to Optional type for SendPackResult
             return SendPackResult(
@@ -4999,6 +5104,7 @@ class AbstractHttpGitClient(GitClient):
             old_refs_typed,
             new_refs,
             push_options=push_options,
+            zero_sha=remote_zero_sha,
         )
         header_pkts = [pkt_line(pkt) for pkt in header_handler]
 
@@ -5021,12 +5127,13 @@ class AbstractHttpGitClient(GitClient):
 
         def body_generator() -> Iterator[bytes]:
             yield from header_pkts
-            if self._should_send_pack(old_refs_typed, new_refs):
+            if self._should_send_pack(
+                old_refs_typed, new_refs, zero_sha=remote_zero_sha
+            ):
                 yield from PackChunkGenerator(
-                    # TODO: Don't hardcode object format
                     num_records=pack_data_count,
                     records=pack_data,
-                    object_format=DEFAULT_OBJECT_FORMAT,
+                    object_format=remote_format,
                 )
 
         resp, read = self._smart_request("git-receive-pack", url, data=body_generator())
@@ -5141,7 +5248,7 @@ class AbstractHttpGitClient(GitClient):
                     iter(pack_data_list),
                     num_records=len(pack_data_list),
                     progress=progress,
-                    object_format=DEFAULT_OBJECT_FORMAT,
+                    object_format=get_object_format(object_format),
                 )
 
             return FetchPackResult(refs, symrefs, agent, object_format=object_format)

@@ -189,6 +189,14 @@ class RepositorySHA256Tests(unittest.TestCase):
 
         # Check hash algorithm
         self.assertEqual(repo.object_format, SHA256)
+        # The object store must share the repository's format so objects are
+        # hashed and keyed at the SHA-256 width rather than the SHA-1 default.
+        self.assertEqual(repo.object_store.object_format, SHA256)
+
+        blob = Blob.from_string(b"memory sha256 blob")
+        blob.object_format = SHA256
+        repo.object_store.add_object(blob)
+        self.assertIn(blob.get_id(SHA256), repo.object_store)
 
 
 class SHA256IndexTests(unittest.TestCase):
